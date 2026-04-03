@@ -19,7 +19,7 @@ export type { Config, FetchResult, ResultMeta, ResultDetail, ParsedResponse };
 
 export type SearchType = "web" | "image" | "video" | "news" | "suggest" | "panel";
 
-/** 大規模・高負荷型コンテンツタイプ */
+/** 大規模・高負荷型コンテンツ（ストリーミング優先） */
 const HEAVY_TYPES: ReadonlySet<SearchType> = new Set(["image", "video"]);
 
 export interface SearchOptions {
@@ -32,8 +32,8 @@ export interface SearchOptions {
   onChunk?: (chunk: unknown) => void;
   usePersistentCache?: boolean;
   /**
-   * true のときメタ情担のみを返す。
-   * 詳細は fetchDetail() で遅延取得する。
+   * true のときメタ情報のみを返す。
+   * summary などの重いフィールドは含まない、0.数秒でリスト描画できる。
    */
   metaOnly?: boolean;
 }
@@ -43,10 +43,6 @@ export interface RequestOptions {
   priority?: PriorityValue;
   onChunk?: ((chunk: unknown) => void) | null;
   usePersistentCache?: boolean;
-}
-
-export interface MetaSearchResult extends FetchResult {
-  meta?: ResultMeta[];
 }
 
 // ---- 初期化・破棄 ---------------------------------------------------
@@ -97,7 +93,6 @@ async function request(
   const cfg = getConfig();
   const lowMem = getIsLowMemory();
 
-  // メモリ圧力に応じたキャッシュ削減
   if (getIsCriticalMemory()) {
     evictExpired();
     trimToHalf();
@@ -119,7 +114,6 @@ async function request(
     const hit = memGet(cacheKey);
     if (hit) {
       if (hit.expired && !lowMem) {
-        // SWR: 期限切れでも即座に返し、バックグラウンドで更新
         enqueue(async () => {
           const r = await fetchWithRetry(url.toString(), _fetchOpts, reqKey);
           if (r.ok) {
@@ -134,7 +128,6 @@ async function request(
     if (usePersistentCache) {
       const pData = await getP(cacheKey);
       if (pData) {
-        // LowMemory 時は永続キャッシュからのみ復元、メモリ展開なし
         if (!lowMem) memSet(cacheKey, pData);
         return { ok: true, data: pData, cached: true, persistent: true };
       }
@@ -187,9 +180,12 @@ function _prefetch(endpoint: string, params: Record<string, unknown>): void {
 // ---- パブリック API ─────────────────────────────────────
 
 /**
- * 小・中規模検索―レスポンス全体を取得しキャッシュする。
- * metaOnly = true のときはメタ情報だけ抽出して返す（メモリ節約）。
- * 詳細データは fetchDetail() で遅延取得する。
+ * 検索のメイン API。
+ *
+ * タイプ別の取得戦略:
+ * - web / news : フル取得 → メモリキャッシュ。metaOnly 時は summary を除いたメタのみ返す。
+ * - image/video : 大規模なのでメタのみ返す。詳細は fetchDetail() で取得。
+ * - LowMemory   : HEAVY タイプはストリーミング強制、summary を筆頭に除外。
  */
 export async function search({
   q,
@@ -204,35 +200,26 @@ export async function search({
 }: SearchOptions): Promise<FetchResult> {
   if (!q?.trim()) return { ok: false, error: "empty_query" };
 
-  const lowMem = getIsLowMemory();
-  const isHeavy = HEAVY_TYPES.has(type);
-  // 大規模コンテンツ or 高負荷状態は強制ストリーミング
+  const lowMem    = getIsLowMemory();
+  const isHeavy   = HEAVY_TYPES.has(type);
   const forceStream = isHeavy && lowMem;
 
   const params = { q: q.trim(), page, type, safesearch, lang };
 
-  // LowMemory 時はプリフェッチ停止
   if (type !== "suggest" && page < 10 && !lowMem) {
     _prefetch("/search", { ...params, page: page + 1 });
   }
 
-  // ---- ストリーミングモード（大規模 or 高負荷） ----
-  if (forceStream || (enableStreaming && !lowMem && onChunk)) {
-    const metaBuf: ResultMeta[] = [];
+  // ---- ストリーミングモード (大規模 or 高負荷時に強制適用) ----
+  if (forceStream || (enableStreaming && onChunk)) {
     const streamChunk = (chunk: unknown): void => {
-      const m = chunkToMeta(chunk);
-      if (m) metaBuf.push(m);
-      onChunk?.(chunk);          // 元の onChunk も呼ぶ
+      onChunk?.(chunk);
     };
-
-    const result = await request("/search", params, {
+    return request("/search", params, {
       priority: Priority.NORMAL,
       onChunk: streamChunk,
       usePersistentCache,
     });
-
-    // ストリーミング中はメモリキャッシュに書き込まない（すでに retry.ts 内でブロック済み）
-    return result;
   }
 
   // ---- 通常モード ----
@@ -244,9 +231,11 @@ export async function search({
 
   if (!result.ok) return result;
 
-  // metaOnly: 必要最小限のフィールドだけ抽出して返す
-  if (metaOnly) {
-    const meta = extractMeta(result.data);
+  // 画像・動画は常に metaOnly（詳細は fetchDetail()）
+  // web / news は metaOnly フラグ or LowMemory（summary を除外）のときのみ
+  const shouldExtractMeta = isHeavy || metaOnly || lowMem;
+  if (shouldExtractMeta) {
+    const meta = extractMeta(result.data, type, lowMem);
     return { ...result, data: meta };
   }
 
@@ -255,12 +244,16 @@ export async function search({
 
 /**
  * メタ情報のみを先に取得するショートハンド。
- * リスト画面の高速描画に使う。
+ * リスト画面の高速初回描画に使う。
  *
  * @example
- * const { data: meta } = await searchMeta({ q: "cats", type: "image" });
- * // ユーザーがクリックしたときに詳細を取得
- * const detail = await fetchDetail({ q: "cats", type: "image" }, 3);
+ * // Web: title, url, summary, favicon
+ * const { data } = await searchMeta({ q: "TypeScript" });
+ *
+ * // Image: title, url, thumbnail, domain
+ * const { data } = await searchMeta({ q: "cats", type: "image" });
+ *
+ * // LowMemory 時は summary を自動省略
  */
 export function searchMeta(
   opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">
@@ -269,11 +262,13 @@ export function searchMeta(
 }
 
 /**
- * キャッシュ済みレスポンスから指定インデックスの詳細データを取得する。
- * ネットワークリクエストは発生しない（キャッシュ済みデータのみ使用）。
+ * キャッシュ済みデータから指定インデックスの詳細データを取得する。
+ * 基本的にネットワークリクエストは発生しない（キャッシュがあれば）。
  *
- * @param opts 元の検索オプション（キャッシュキーの特定に使う）
- * @param idx  results 配列のインデックス
+ * @example
+ * // ユーザーが結果をクリックしたとき
+ * const detail = await fetchDetail({ q: "TypeScript", type: "web" }, 2);
+ * // detail.summary, detail.favicon など全フィールドあり
  */
 export async function fetchDetail(
   opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">,
@@ -282,26 +277,25 @@ export async function fetchDetail(
   const { q, page = 1, type = "web", safesearch = 0, lang = "ja", usePersistentCache = false } = opts;
   if (!q?.trim()) return null;
 
-  const params = { q: q.trim(), page, type, safesearch, lang };
+  const params  = { q: q.trim(), page, type, safesearch, lang };
   const cacheKey = getCacheKey("/search", params);
 
-  // まずメモリキャッシュから
+  // 1. メモリキャッシュから
   const hit = memGet(cacheKey);
   if (hit) return extractDetail(hit.data, idx);
 
-  // 永続キャッシュから
+  // 2. 永続キャッシュから
   if (usePersistentCache) {
     const pData = await getP(cacheKey);
     if (pData) return extractDetail(pData, idx);
   }
 
-  // キャッシュなし→フル取得
+  // 3. キャッシュなし → フル取得（不少ないケース）
   const result = await request("/search", params, {
     priority: Priority.NORMAL,
     usePersistentCache,
   });
-  if (!result.ok) return null;
-  return extractDetail(result.data, idx);
+  return result.ok ? extractDetail(result.data, idx) : null;
 }
 
 // ---- タイプ別ショートハンド -------------------------------------------
