@@ -1,5 +1,5 @@
 // src/cache/persistent.ts
-import { getConfig } from "../config.ts";
+import { getConfig } from "../config.js";
 
 let _dbPromise: Promise<IDBDatabase | null> | null = null;
 
@@ -99,7 +99,6 @@ export async function cleanup(): Promise<void> {
   });
 }
 
-/** DB 接続を閉じてキャッシュをリセット（ページ離脱・テスト用） */
 export async function destroyDB(): Promise<void> {
   const db = await _open();
   db?.close();
