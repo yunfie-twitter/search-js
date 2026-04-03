@@ -262,9 +262,14 @@ export function getSuggest(q: string): Promise<SuggestResult> {
  * debounce
  * ========================= */
 
-const _debouncedFns = new Map<
+// delay ごとに getSuggest の debounce済み関数をキャッシュする
+// コールバックは debounce の外で受け取ることで、関数の同一性を保ちフリーズを防ぐ
+const _debouncedFetchers = new Map<
   number,
-  (q: string, cb: (r: SuggestResult) => void) => void
+  ((q: string) => Promise<SuggestResult>) & {
+    cancel: () => void;
+    flush: () => Promise<SuggestResult> | undefined;
+  }
 >();
 
 export function getSuggestDebounced(
@@ -274,26 +279,30 @@ export function getSuggestDebounced(
 ): void {
   const delay = wait ?? getConfig().SUGGEST_DEBOUNCE_MS;
 
-  if (!_debouncedFns.has(delay)) {
-    const fn = (innerQ: string, cb: (r: SuggestResult) => void): void => {
-      getSuggest(innerQ)
-        .then(cb)
-        .catch(() =>
-          cb({
-            ok: false,
-            query: innerQ,
-            items: [],
-            error: "unknown",
-          })
-        );
-    };
-
-    //  正しい呼び方
-    _debouncedFns.set(
+  if (!_debouncedFetchers.has(delay)) {
+    // getSuggest だけを debounce 化する（cb は外側で受け取る）
+    // usePromise: true（デフォルト）で正しくオブジェクト形式で渡す
+    _debouncedFetchers.set(
       delay,
-      debounce(fn, delay, false) as (q: string, cb: (r: SuggestResult) => void) => void
+      debounce(getSuggest, { delay, usePromise: true })
     );
   }
 
-  _debouncedFns.get(delay)!(q, callback);
+  const debouncedFetch = _debouncedFetchers.get(delay)!;
+
+  // debounce が返す Promise に対してコールバックを接続する
+  // 古い呼び出しのコールバックは新しい呼び出しで上書きされるため競合しない
+  const result = debouncedFetch(q);
+  if (result) {
+    result
+      .then(callback)
+      .catch(() =>
+        callback({
+          ok: false,
+          query: q,
+          items: [],
+          error: "unknown",
+        })
+      );
+  }
 }
