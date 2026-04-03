@@ -1,9 +1,9 @@
 // src/request/retry.ts
 import { getConfig } from "../config.ts";
 
-export interface FetchResult {
+export interface FetchResult<T = unknown> {
   ok: boolean;
-  data?: unknown;
+  data?: T;
   error?: string;
   status?: number;
   cached?: boolean;
@@ -12,12 +12,14 @@ export interface FetchResult {
   streamed?: boolean;
 }
 
-// 進行中リクエストの AbortController マップ
 const controllers = new Map<string, AbortController>();
 
 export function cancel(key: string): void {
-  controllers.get(key)?.abort();
-  controllers.delete(key);
+  const ctrl = controllers.get(key);
+  if (ctrl) {
+    ctrl.abort();
+    controllers.delete(key);
+  }
 }
 
 export function cancelAll(): void {
@@ -25,33 +27,41 @@ export function cancelAll(): void {
   controllers.clear();
 }
 
-export async function fetchWithRetry(
+export async function fetchWithRetry<T = unknown>(
   url: string,
-  opts: RequestInit,
+  opts: RequestInit = {},
   key: string,
-  onChunk?: (chunk: unknown) => void
-): Promise<FetchResult> {
+  onChunk?: (chunk: T) => void
+): Promise<FetchResult<T>> {
   const cfg = getConfig();
+
   const canAbort = typeof AbortController !== "undefined";
-  const canStream = typeof ReadableStream !== "undefined" && !!onChunk;
+  const canStream = typeof ReadableStream !== "undefined";
 
   for (let attempt = 0; attempt <= cfg.RETRIES; attempt++) {
-    // 同一キーの前回分を必ずキャンセルしてリーク防止
-    controllers.get(key)?.abort();
+    // ---- AbortController ----
+    const prev = controllers.get(key);
+    if (prev) {
+      prev.abort();
+      controllers.delete(key);
+    }
+
     const ctrl = canAbort ? new AbortController() : null;
     if (ctrl) controllers.set(key, ctrl);
 
-    // 外部 signal と内部 ctrl のマージ
+    // ---- signal merge ----
     const externalSignal = opts.signal;
     let mergedSignal: AbortSignal | undefined;
+    let cleanupExternal: (() => void) | undefined;
+
     if (ctrl && externalSignal) {
-      // 両方のキャンセルを捕捉
       if (typeof AbortSignal.any === "function") {
         mergedSignal = AbortSignal.any([ctrl.signal, externalSignal]);
       } else {
-        // フォールバック: 外部 signal を監視して ctrl に伝總
         const bridge = (): void => ctrl.abort();
         externalSignal.addEventListener("abort", bridge, { once: true });
+        cleanupExternal = () =>
+          externalSignal.removeEventListener("abort", bridge);
         mergedSignal = ctrl.signal;
       }
     } else {
@@ -62,14 +72,16 @@ export async function fetchWithRetry(
       ? { ...opts, signal: mergedSignal }
       : opts;
 
-    // タイムアウトは ctrl ベースのシグナルのみ abort
-    const tid = ctrl
-      ? setTimeout(() => ctrl.abort(), cfg.TIMEOUT)
-      : undefined;
+    const tid =
+      ctrl !== null
+        ? setTimeout(() => ctrl.abort(), cfg.TIMEOUT)
+        : undefined;
 
     try {
       const res = await fetch(url, fetchOpts);
-      clearTimeout(tid);
+
+      if (tid) clearTimeout(tid);
+      cleanupExternal?.();
       controllers.delete(key);
 
       if (!res.ok) {
@@ -80,26 +92,54 @@ export async function fetchWithRetry(
         };
       }
 
-      if (canStream && res.body) {
-        return await _readStream(res.body, ctrl, onChunk!, cfg);
+      // ---- streaming ----
+      if (canStream && res.body && onChunk) {
+        return await _readStream<T>(res.body, ctrl, onChunk, cfg);
       }
 
-      return { ok: true, data: await res.json() };
+      // ---- safe parse ----
+      const contentType = res.headers.get("content-type") || "";
+
+      let data: unknown;
+
+      if (contentType.includes("application/json")) {
+        data = res.status === 204 ? null : await res.json();
+      } else {
+        data = await res.text();
+      }
+
+      return { ok: true, data: data as T };
 
     } catch (err) {
-      clearTimeout(tid);
+      if (tid) clearTimeout(tid);
+      cleanupExternal?.();
       controllers.delete(key);
 
       if (err instanceof Error) {
-        if (err.name === "AbortError" || err.message?.includes("aborted")) {
-          return { ok: false, error: "cancelled" };
+        // Abort
+        if (err.name === "AbortError" || err.message.includes("aborted")) {
+          return { ok: false, error: "cancelled", status: 0 };
         }
-        if (err instanceof TypeError) {
-          if (attempt === cfg.RETRIES) return { ok: false, error: "network_error" };
-          await _sleep(cfg.RETRY_BACKOFF_BASE * 2 ** attempt);
+
+        // Network error
+        if (
+          err instanceof TypeError ||
+          err.name === "NetworkError"
+        ) {
+          if (attempt === cfg.RETRIES) {
+            return { ok: false, error: "network_error" };
+          }
+
+          // jitter付きバックオフ
+          const base = cfg.RETRY_BACKOFF_BASE * 2 ** attempt;
+          const jitter = base * (0.5 + Math.random() * 0.5);
+          await _sleep(jitter);
           continue;
         }
+
+        return { ok: false, error: err.message };
       }
+
       return { ok: false, error: "unknown_error" };
     }
   }
@@ -108,83 +148,87 @@ export async function fetchWithRetry(
 }
 
 const _sleep = (ms: number): Promise<void> =>
-  new Promise<void>((r) => setTimeout(r, ms));
+  new Promise((r) => setTimeout(r, ms));
 
-/**
- * ストリームを読み取って JSON オブジェクトを逆次コールバックに渡す。
- *
- * リーク防止のための保証:
- * - finally で必ず reader.releaseLock()
- * - { once: true } で abort リスナーを自動解除
- * - finally で buf を空文字列にして文字列参照を切る
- * - aborted 時は reader.cancel() でストリームを閉じる
- */
-async function _readStream(
+async function _readStream<T>(
   body: ReadableStream<Uint8Array>,
   ctrl: AbortController | null,
-  onChunk: (chunk: unknown) => void,
+  onChunk: (chunk: T) => void,
   cfg: ReturnType<typeof getConfig>
-): Promise<FetchResult> {
+): Promise<FetchResult<T>> {
   const reader = body.getReader();
   const dec = new TextDecoder();
+
   let buf = "";
   let braces = 0;
   let inStr = false;
   let esc = false;
   let aborted = false;
-  const chunks: unknown[] = [];
+
+  const chunks: T[] = [];
 
   const onAbort = (): void => {
     aborted = true;
-    // cancel() は非同期なので void で捨てる
     reader.cancel().catch(() => {});
   };
+
   ctrl?.signal.addEventListener("abort", onAbort, { once: true });
 
   try {
-    outer: while (!aborted) {
-      let readResult: ReadableStreamReadResult<Uint8Array>;
+    while (!aborted) {
+      let result: ReadableStreamReadResult<Uint8Array>;
+
       try {
-        readResult = await reader.read();
+        result = await reader.read();
       } catch {
-        // キャンセル・ネットワークエラーはループを抖り出す
-        break outer;
+        break;
       }
-      if (readResult.done) break;
-      buf += dec.decode(readResult.value, { stream: true });
-      if (buf.length > cfg.STREAMING_BUFFER_SIZE) _flush();
+
+      if (result.done) break;
+
+      buf += dec.decode(result.value, { stream: true });
+
+      if (buf.length > cfg.STREAMING_BUFFER_SIZE) flush();
     }
-    if (!aborted) _flush();
+
+    if (!aborted) flush();
+
   } finally {
     ctrl?.signal.removeEventListener("abort", onAbort);
-    // releaseLock は cancel 後でも安全に呼び出せる
-    try { reader.releaseLock(); } catch { /* 既に解放済みの場合 */ }
+    try { reader.releaseLock(); } catch {}
     buf = "";
   }
 
   return {
     ok: !aborted,
     ...(aborted ? { error: "cancelled" } : {}),
-    data: chunks.length === 1 ? chunks[0] : chunks,
+    data: (chunks.length === 1 ? chunks[0] : chunks) as T,
     streamed: true,
   };
 
-  function _flush(): void {
+  function flush(): void {
     let start = 0;
+
     for (let i = 0; i < buf.length; i++) {
       const c = buf[i];
-      if (esc)         { esc = false; continue; }
-      if (c === "\\")  { esc = true;  continue; }
-      if (c === '"')   { inStr = !inStr; continue; }
-      if (inStr)       continue;
-      if (c === "{")   { if (!braces) start = i; braces++; }
-      else if (c === "}") {
-        if (!--braces) {
+
+      if (esc) { esc = false; continue; }
+      if (c === "\\") { esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+
+      if (c === "{") {
+        if (!braces) start = i;
+        braces++;
+      } else if (c === "}") {
+        braces--;
+        if (!braces) {
           try {
-            const obj: unknown = JSON.parse(buf.slice(start, i + 1));
+            const obj = JSON.parse(buf.slice(start, i + 1)) as T;
             chunks.push(obj);
             onChunk(obj);
-          } catch { /* malformed JSON は無視 */ }
+          } catch {}
+
           buf = buf.slice(i + 1);
           i = -1;
         }
