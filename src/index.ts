@@ -15,6 +15,7 @@ import {
   getSuggest as _getSuggest,
   getSuggestDebounced,
   clearSuggestCache,
+  clearSuggestDebouncers,
   type SuggestItem,
   type SuggestResult,
 } from "./suggest.js";
@@ -98,6 +99,7 @@ export async function destroy(): Promise<void> {
   inFlight.clear();
   clearStore();
   clearSuggestCache();
+  clearSuggestDebouncers();
   clearAllListeners();
   destroyOfflineMonitor();
   await destroyDB();
