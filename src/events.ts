@@ -1,15 +1,10 @@
 // src/events.ts
 // 軽量イベントエミッター
-// メモリ状態変化・オフライン状態などをライブラリ外から購読できる
 
 export type SearchEventMap = {
-  /** Low / Critical / Normal の切り替わり */
   memoryStateChange: { isLow: boolean; isCritical: boolean };
-  /** オンライン復帰 */
   online: undefined;
-  /** オフライン変移 */
   offline: undefined;
-  /** SWR バックグラウンド更新完了 */
   cacheRefreshed: { key: string };
 };
 
@@ -31,7 +26,6 @@ export function on<K extends keyof SearchEventMap>(
   handler: Handler<SearchEventMap[K]>
 ): () => void {
   (_listeners[event] as Set<Handler<SearchEventMap[K]>>).add(handler);
-  // 返値は unsubscribe 関数
   return () => off(event, handler);
 }
 
@@ -47,7 +41,8 @@ export function emit<K extends keyof SearchEventMap>(
   ...args: SearchEventMap[K] extends undefined ? [] : [SearchEventMap[K]]
 ): void {
   const set = _listeners[event] as Set<Handler<SearchEventMap[K]>>;
-  for (const fn of set) {
+  // スナップショットでイテレートすることで、ハンドラ内での off() 呼び出しによる ConcurrentModification を防ぐ
+  for (const fn of [...set]) {
     try {
       // @ts-expect-error payload は型安全だが TS が流を追えない
       fn(...args);
@@ -57,7 +52,6 @@ export function emit<K extends keyof SearchEventMap>(
   }
 }
 
-/** 全ハンドラを解除（destroy 用） */
 export function clearAllListeners(): void {
   for (const key of Object.keys(_listeners) as (keyof SearchEventMap)[]) {
     (_listeners[key] as Set<unknown>).clear();

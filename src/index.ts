@@ -3,12 +3,12 @@ import { configure, getConfig, type Config } from "./config.ts";
 import { store as memStore, clearStore, evictExpired, trimToHalf } from "./cache/memory.ts";
 import { getCacheKey, get as memGet, set as memSet } from "./cache/memory.ts";
 import { getP, setP, cleanup, destroyDB } from "./cache/persistent.ts";
-import { initMemoryMonitor, getIsLowMemory, getIsCriticalMemory, destroyMemoryMonitor } from "./memory.ts";
+import { initMemoryMonitor, getIsLowMemory, getIsCriticalMemory, getCurrentCacheMax, destroyMemoryMonitor } from "./memory.ts";
 import { enqueue, Priority, clearQueues, type PriorityValue } from "./request/queue.ts";
 import { fetchWithRetry, cancel as cancelRequest, cancelAll, type FetchResult } from "./request/retry.ts";
 import { debounce } from "./utils.ts";
 import {
-  extractMeta, extractDetail, chunkToMeta,
+  extractMeta, extractDetail,
   type ResultMeta, type ResultDetail, type ParsedResponse,
 } from "./parser.ts";
 import {
@@ -53,7 +53,6 @@ export interface SearchOptions {
   onChunk?: (chunk: unknown) => void;
   usePersistentCache?: boolean;
   metaOnly?: boolean;
-  /** 外部からキャンセルするための AbortSignal */
   signal?: AbortSignal;
 }
 
@@ -78,12 +77,12 @@ export interface SearchStats {
 
 export function getSearchStats(): SearchStats {
   return {
-    memoryCacheSize: memStore.size,
-    memoryCacheMax: memStore.size, // getCurrentCacheMax() の値を利用
-    isLowMemory: getIsLowMemory(),
+    memoryCacheSize:  memStore.size,
+    memoryCacheMax:   getCurrentCacheMax(),
+    isLowMemory:      getIsLowMemory(),
     isCriticalMemory: getIsCriticalMemory(),
-    inFlightCount: inFlight.size,
-    isOnline: getIsOnline(),
+    inFlightCount:    inFlight.size,
+    isOnline:         getIsOnline(),
   };
 }
 
@@ -137,10 +136,8 @@ async function request(
     signal,
   }: RequestOptions = {}
 ): Promise<FetchResult> {
-  const cfg = getConfig();
+  const cfg    = getConfig();
   const lowMem = getIsLowMemory();
-
-  // オフライン時はキャッシュのみ返す
   const offline = !getIsOnline();
 
   if (getIsCriticalMemory()) {
@@ -151,7 +148,7 @@ async function request(
   }
 
   const url = new URL(cfg.API_BASE + endpoint);
-  const sp = url.searchParams;
+  const sp  = url.searchParams;
   for (const k in params) {
     const v = params[k];
     if (v != null) sp.append(k, String(v));
@@ -164,7 +161,6 @@ async function request(
     const hit = memGet(cacheKey);
     if (hit) {
       if (hit.expired && !lowMem && !offline) {
-        // SWR: 期限切れでも即座に返し、バックグラウンド更新
         enqueue(async () => {
           const r = await fetchWithRetry(url.toString(), _fetchOpts, reqKey);
           if (r.ok) {
@@ -186,32 +182,33 @@ async function request(
     }
   }
 
-  // オフライン & キャッシュなし→エラーを返す
   if (offline) return { ok: false, error: "offline" };
+
+  // 外部 signal が既にキャンセル済みなら即座に返す
+  if (signal?.aborted) return { ok: false, error: "cancelled" };
 
   const existing = inFlight.get(reqKey);
   if (existing) return existing;
 
-  // 外部 signal と内部 AbortController をマージ
-  const mergedOpts: RequestInit = signal
+  const fetchOpts: RequestInit = signal
     ? { ..._fetchOpts, signal }
     : _fetchOpts;
 
   const promise = new Promise<FetchResult>((resolve, reject) => {
-    // 外部 signal で即座キャンセルされた場合
-    if (signal?.aborted) {
-      reject(new DOMException("Aborted", "AbortError"));
-      return;
-    }
-    const onAbort = (): void => reject(new DOMException("Aborted", "AbortError"));
+    // 外部 signal でキャンセルされたら enqueue 待機中でも即座に abort
+    const onAbort = (): void => resolve({ ok: false, error: "cancelled" });
     signal?.addEventListener("abort", onAbort, { once: true });
 
     enqueue(async () => {
       signal?.removeEventListener("abort", onAbort);
+      if (signal?.aborted) {
+        resolve({ ok: false, error: "cancelled" });
+        return;
+      }
       try {
         const result = await fetchWithRetry(
           url.toString(),
-          mergedOpts,
+          fetchOpts,
           reqKey,
           onChunk ?? undefined
         );
@@ -219,10 +216,9 @@ async function request(
           if (!lowMem) memSet(cacheKey, result.data);
           if (usePersistentCache) await setP(cacheKey, result.data);
         }
-        // リクエスト失敗時はリトライタスクを登録
         if (!result.ok && result.error === "network_error") {
           addRetryTask(async () => {
-            const r = await fetchWithRetry(url.toString(), mergedOpts, reqKey);
+            const r = await fetchWithRetry(url.toString(), _fetchOpts, reqKey);
             if (r.ok) {
               if (!lowMem) memSet(cacheKey, r.data);
               if (usePersistentCache) await setP(cacheKey, r.data);
@@ -231,7 +227,8 @@ async function request(
         }
         resolve(result);
       } catch (e) {
-        reject(e);
+        // 未処理の例外を安全に吸収
+        resolve({ ok: false, error: e instanceof Error ? e.message : "unknown_error" });
       } finally {
         inFlight.delete(reqKey);
       }
@@ -272,8 +269,8 @@ export async function search({
 }: SearchOptions): Promise<FetchResult> {
   if (!q?.trim()) return { ok: false, error: "empty_query" };
 
-  const lowMem    = getIsLowMemory();
-  const isHeavy   = HEAVY_TYPES.has(type);
+  const lowMem     = getIsLowMemory();
+  const isHeavy    = HEAVY_TYPES.has(type);
   const forceStream = isHeavy && lowMem;
 
   const params = { q: q.trim(), page, type, safesearch, lang };
@@ -347,50 +344,30 @@ export function getSuggest(q: string): Promise<SuggestResult> {
 // ---- createPager() -------------------------------------------------------
 
 export interface Pager {
-  /** 次のページを取得する。末尾なら null */
   next(): Promise<FetchResult | null>;
-  /** 前のページに戻る。先頭なら null */
   prev(): Promise<FetchResult | null>;
-  /** 現在のページ番号 */
   readonly currentPage: number;
-  /** ページをリセット */
   reset(): void;
 }
 
-/**
- * ページネーションヘルパー。
- * next() で自動的に次のページをプリフェッチする。
- *
- * @example
- * const pager = createPager({ q: "TypeScript", type: "web" });
- * const page1 = await pager.next();
- * const page2 = await pager.next();
- * pager.reset();
- */
 export function createPager(
   opts: Omit<SearchOptions, "page">,
   maxPage = 10
 ): Pager {
   let _page = 0;
-
   return {
     get currentPage() { return _page; },
-
     async next(): Promise<FetchResult | null> {
       if (_page >= maxPage) return null;
       _page++;
       return search({ ...opts, page: _page });
     },
-
     async prev(): Promise<FetchResult | null> {
       if (_page <= 1) return null;
       _page--;
       return search({ ...opts, page: _page });
     },
-
-    reset(): void {
-      _page = 0;
-    },
+    reset(): void { _page = 0; },
   };
 }
 
@@ -398,15 +375,6 @@ export function createPager(
 
 export type SearchAllResult = Partial<Record<SearchType, FetchResult>>;
 
-/**
- * 複数タイプを並列取得する。
- * 失敗したタイプは履歴に残らず結果マップに含まれない。
- *
- * @example
- * const results = await searchAll({ q: "TypeScript" }, ["web", "news"]);
- * results.web?.data;  // Web 検索結果
- * results.news?.data; // ニュース検索結果
- */
 export async function searchAll(
   opts: Omit<SearchOptions, "type">,
   types: SearchType[] = ["web", "news"]
@@ -414,7 +382,6 @@ export async function searchAll(
   const entries = await Promise.allSettled(
     types.map((type) => search({ ...opts, type }))
   );
-
   const result: SearchAllResult = {};
   for (let i = 0; i < types.length; i++) {
     const settled = entries[i];
@@ -427,8 +394,8 @@ export async function searchAll(
 
 // ---- タイプ別ショートハンド -------------------------------------------
 
-export const searchWeb   = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "web", signal });
+export const searchWeb   = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "web",   signal });
 export const searchImage = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "image", signal });
 export const searchVideo = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "video", signal });
-export const searchNews  = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "news", signal });
-export const searchPanel = (q: string, signal?: AbortSignal): Promise<FetchResult>           => search({ q, type: "panel", signal });
+export const searchNews  = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "news",  signal });
+export const searchPanel = (q: string,            signal?: AbortSignal): Promise<FetchResult> => search({ q,       type: "panel", signal });
