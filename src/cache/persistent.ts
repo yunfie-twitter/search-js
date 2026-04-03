@@ -4,7 +4,8 @@ import { getConfig } from "../config.ts";
 let _dbPromise: Promise<IDBDatabase | null> | null = null;
 
 function _open(): Promise<IDBDatabase | null> {
-  if (!globalThis.indexedDB || _dbPromise) return _dbPromise ?? Promise.resolve(null);
+  if (typeof globalThis.indexedDB === "undefined") return Promise.resolve(null);
+  if (_dbPromise) return _dbPromise;
 
   _dbPromise = new Promise<IDBDatabase | null>((resolve) => {
     const req = indexedDB.open("ApiCache", 2);
@@ -26,12 +27,15 @@ export async function getP(key: string): Promise<unknown> {
   if (!db) return null;
 
   return new Promise<unknown>((resolve) => {
-    const req = db.transaction(["cache"], "readonly")
-      .objectStore("cache").get(key);
+    const req = db
+      .transaction(["cache"], "readonly")
+      .objectStore("cache")
+      .get(key);
     req.onsuccess = () => {
       const item = req.result as { time: number; data: unknown } | undefined;
-      resolve(item && Date.now() - item.time < getConfig().CACHE_TTL
-        ? item.data : null);
+      resolve(
+        item && Date.now() - item.time < getConfig().CACHE_TTL ? item.data : null
+      );
     };
     req.onerror = () => resolve(null);
   });
@@ -42,8 +46,12 @@ export async function setP(key: string, data: unknown): Promise<void> {
   if (!db) return;
 
   const cfg = getConfig();
-  return new Promise<void>((resolve) => {
+  return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(["cache"], "readwrite");
+    // トランザクション自体のエラーも捕捉してリークを防ぐ
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+
     const store = tx.objectStore("cache");
     const countReq = store.count();
 
@@ -63,11 +71,13 @@ export async function setP(key: string, data: unknown): Promise<void> {
             resolve();
           }
         };
+        cur.onerror = () => reject(cur.error);
       } else {
         store.put({ data, time: Date.now() }, key);
-        resolve();
+        tx.oncomplete = () => resolve();
       }
     };
+    countReq.onerror = () => reject(countReq.error);
   });
 }
 
@@ -76,11 +86,25 @@ export async function cleanup(): Promise<void> {
   if (!db) return;
   const cfg = getConfig();
   const cutoff = Date.now() - cfg.CACHE_TTL;
-  const req = db.transaction(["cache"], "readwrite")
-    .objectStore("cache").index("time")
-    .openCursor(IDBKeyRange.upperBound(cutoff));
-  req.onsuccess = (e: Event) => {
-    const c = (e.target as IDBRequest<IDBCursorWithValue | null>).result;
-    if (c) { c.delete(); c.continue(); }
-  };
+
+  return new Promise<void>((resolve) => {
+    const req = db
+      .transaction(["cache"], "readwrite")
+      .objectStore("cache")
+      .index("time")
+      .openCursor(IDBKeyRange.upperBound(cutoff));
+    req.onsuccess = (e: Event) => {
+      const c = (e.target as IDBRequest<IDBCursorWithValue | null>).result;
+      if (c) { c.delete(); c.continue(); }
+      else resolve();
+    };
+    req.onerror = () => resolve(); // エラーでも resolve してブロックしない
+  });
+}
+
+/** DB 接続を閉じてキャッシュをリセット（ページ離脱・テスト用） */
+export async function destroyDB(): Promise<void> {
+  const db = await _open();
+  db?.close();
+  _dbPromise = null;
 }

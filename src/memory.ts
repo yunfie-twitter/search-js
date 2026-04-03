@@ -16,12 +16,20 @@ const capabilities: Capabilities = {
 };
 
 let isLowMemory = false;
-let currentCacheMax: number;
+let currentCacheMax: number = 0;
+let _monitorTimer: ReturnType<typeof setInterval> | null = null;
 
 export const getIsLowMemory = (): boolean => isLowMemory;
 export const getCurrentCacheMax = (): number => currentCacheMax;
 
+/** メモリモニターを初期化。複数回呼ばれても timer は1つだけ保持する */
 export function initMemoryMonitor(cacheRef: Map<unknown, unknown>): void {
+  // 既存タイマーをクリアして多重登録を防ぐ
+  if (_monitorTimer !== null) {
+    clearInterval(_monitorTimer);
+    _monitorTimer = null;
+  }
+
   const cfg = getConfig();
   currentCacheMax = cfg.CACHE_MAX;
 
@@ -30,7 +38,15 @@ export function initMemoryMonitor(cacheRef: Map<unknown, unknown>): void {
     currentCacheMax = cfg.CACHE_LOW_MEMORY;
   }
 
-  setInterval(() => _check(cacheRef), cfg.MEMORY_CHECK_INTERVAL);
+  _monitorTimer = setInterval(() => _check(cacheRef), cfg.MEMORY_CHECK_INTERVAL);
+}
+
+/** テスト・SSR 用にモニターを停止する */
+export function destroyMemoryMonitor(): void {
+  if (_monitorTimer !== null) {
+    clearInterval(_monitorTimer);
+    _monitorTimer = null;
+  }
 }
 
 function _check(cacheRef: Map<unknown, unknown>): void {
@@ -38,7 +54,9 @@ function _check(cacheRef: Map<unknown, unknown>): void {
   let pressure = 0;
 
   if (capabilities.performanceMemory) {
-    const mem = (performance as Performance & { memory: { usedJSHeapSize: number; jsHeapSizeLimit: number } }).memory;
+    const mem = (performance as Performance & {
+      memory: { usedJSHeapSize: number; jsHeapSizeLimit: number };
+    }).memory;
     pressure = Math.max(pressure, (mem.usedJSHeapSize / mem.jsHeapSizeLimit) * 100);
   }
 

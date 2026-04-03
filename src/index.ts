@@ -1,14 +1,14 @@
 // src/index.ts
 import { configure, getConfig, type Config } from "./config.ts";
-import { store as memStore } from "./cache/memory.ts";
+import { store as memStore, clearStore } from "./cache/memory.ts";
 import { getCacheKey, get as memGet, set as memSet } from "./cache/memory.ts";
-import { getP, setP, cleanup } from "./cache/persistent.ts";
-import { initMemoryMonitor, getIsLowMemory } from "./memory.ts";
-import { enqueue, Priority, type PriorityValue } from "./request/queue.ts";
-import { fetchWithRetry, cancel as cancelRequest, type FetchResult } from "./request/retry.ts";
+import { getP, setP, cleanup, destroyDB } from "./cache/persistent.ts";
+import { initMemoryMonitor, getIsLowMemory, destroyMemoryMonitor } from "./memory.ts";
+import { enqueue, Priority, clearQueues, type PriorityValue } from "./request/queue.ts";
+import { fetchWithRetry, cancel as cancelRequest, cancelAll, type FetchResult } from "./request/retry.ts";
 import { debounce } from "./utils.ts";
 
-export { configure, debounce, cancelRequest };
+export { configure, debounce, cancelRequest, cancelAll };
 export type { Config, FetchResult };
 
 export interface SearchOptions {
@@ -29,10 +29,41 @@ export interface RequestOptions {
   usePersistentCache?: boolean;
 }
 
+let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
 export function init(options: Partial<Config> = {}): void {
   configure(options);
   initMemoryMonitor(memStore);
-  setInterval(cleanup, getConfig().PERSISTENT_CLEANUP_INTERVAL);
+
+  // 既存タイマーをクリアして多重登録を防ぐ
+  if (_cleanupTimer !== null) {
+    clearInterval(_cleanupTimer);
+  }
+  _cleanupTimer = setInterval(cleanup, getConfig().PERSISTENT_CLEANUP_INTERVAL);
+}
+
+/**
+ * 全リソースを解放する。
+ * SPA のルート切り替えやテスト後に呼ぶことでメモリリークを防ぐ。
+ */
+export async function destroy(): Promise<void> {
+  // 進行中リクエストを全キャンセル
+  cancelAll();
+  // キューをクリア
+  clearQueues();
+  // in-flight マップをクリア
+  inFlight.clear();
+  // メモリキャッシュをクリア
+  clearStore();
+  // IndexedDB 接続を閉じる
+  await destroyDB();
+  // モニタータイマーを停止
+  destroyMemoryMonitor();
+  // クリーンアップタイマーを停止
+  if (_cleanupTimer !== null) {
+    clearInterval(_cleanupTimer);
+    _cleanupTimer = null;
+  }
 }
 
 // In-flight deduplication
@@ -66,6 +97,7 @@ async function request(
     const hit = memGet(cacheKey);
     if (hit) {
       if (hit.expired) {
+        // SWR: バックグラウンド再取得（エラーは握りつぶさず console に流す）
         enqueue(async () => {
           const r = await fetchWithRetry(url.toString(), _fetchOpts(), reqKey);
           if (r.ok) {
@@ -92,7 +124,12 @@ async function request(
   const promise = new Promise<FetchResult>((resolve, reject) => {
     enqueue(async () => {
       try {
-        const result = await fetchWithRetry(url.toString(), _fetchOpts(), reqKey, onChunk ?? undefined);
+        const result = await fetchWithRetry(
+          url.toString(),
+          _fetchOpts(),
+          reqKey,
+          onChunk ?? undefined
+        );
         if (result.ok && useCache && !result.streamed) {
           memSet(cacheKey, result.data);
           if (usePersistentCache) await setP(cacheKey, result.data);
@@ -101,6 +138,7 @@ async function request(
       } catch (e) {
         reject(e);
       } finally {
+        // 完了後は必ず in-flight から削除してリークを防ぐ
         inFlight.delete(reqKey);
       }
     }, priority);
