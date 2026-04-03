@@ -7,19 +7,35 @@ import { initMemoryMonitor, getIsLowMemory, getIsCriticalMemory, destroyMemoryMo
 import { enqueue, Priority, clearQueues, type PriorityValue } from "./request/queue.ts";
 import { fetchWithRetry, cancel as cancelRequest, cancelAll, type FetchResult } from "./request/retry.ts";
 import { debounce } from "./utils.ts";
+import {
+  extractMeta, extractDetail, chunkToMeta,
+  type ResultMeta, type ResultDetail, type ParsedResponse,
+} from "./parser.ts";
 
 export { configure, debounce, cancelRequest, cancelAll };
-export type { Config, FetchResult };
+export type { Config, FetchResult, ResultMeta, ResultDetail, ParsedResponse };
+
+// ---- 型定義 -------------------------------------------------------
+
+export type SearchType = "web" | "image" | "video" | "news" | "suggest" | "panel";
+
+/** 大規模・高負荷型コンテンツタイプ */
+const HEAVY_TYPES: ReadonlySet<SearchType> = new Set(["image", "video"]);
 
 export interface SearchOptions {
   q: string;
   page?: number;
-  type?: "web" | "image" | "video" | "news" | "suggest" | "panel";
+  type?: SearchType;
   safesearch?: 0 | 1 | 2;
   lang?: string;
   enableStreaming?: boolean;
   onChunk?: (chunk: unknown) => void;
   usePersistentCache?: boolean;
+  /**
+   * true のときメタ情担のみを返す。
+   * 詳細は fetchDetail() で遅延取得する。
+   */
+  metaOnly?: boolean;
 }
 
 export interface RequestOptions {
@@ -28,6 +44,12 @@ export interface RequestOptions {
   onChunk?: ((chunk: unknown) => void) | null;
   usePersistentCache?: boolean;
 }
+
+export interface MetaSearchResult extends FetchResult {
+  meta?: ResultMeta[];
+}
+
+// ---- 初期化・破棄 ---------------------------------------------------
 
 let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -38,32 +60,29 @@ export function init(options: Partial<Config> = {}): void {
   _cleanupTimer = setInterval(cleanup, getConfig().PERSISTENT_CLEANUP_INTERVAL);
 }
 
-/**
- * 全リソースを解放する。
- * SPA のルート切り替えや React の useEffect cleanup で呼ぶことでメモリリークを完全防止。
- */
 export async function destroy(): Promise<void> {
-  cancelAll();           // 進行中の全リクエストをキャンセル
-  clearQueues();         // 待機中タスクを破棄
-  inFlight.clear();      // in-flight 重複排除マップをクリア
-  clearStore();          // メモリキャッシュをクリア
-  await destroyDB();     // IndexedDB 接続を閉じる
-  destroyMemoryMonitor(); // タイマーを停止
+  cancelAll();
+  clearQueues();
+  inFlight.clear();
+  clearStore();
+  await destroyDB();
+  destroyMemoryMonitor();
   if (_cleanupTimer !== null) {
     clearInterval(_cleanupTimer);
     _cleanupTimer = null;
   }
 }
 
-// ── In-flight 重複排除 ────────────────────────────────────────────
-// 同じクエリが同時に複数発行された場合、1 つの Promise を共有して
-// 無駄なネットワークリクエストとメモリ消費を防ぐ。
+// ---- In-flight 重複排除 -----------------------------------------------
+
 const inFlight = new Map<string, Promise<FetchResult>>();
 
 function _requestKey(endpoint: string, params: Record<string, unknown>): string {
   const p = params as { q?: string; page?: number; type?: string };
   return endpoint + "\x00" + (p.q ?? "") + "\x00" + (p.page ?? 1) + "\x00" + (p.type ?? "web");
 }
+
+// ---- 内部 request() --------------------------------------------------
 
 async function request(
   endpoint: string,
@@ -78,12 +97,11 @@ async function request(
   const cfg = getConfig();
   const lowMem = getIsLowMemory();
 
-  // Critical メモリ時はキャッシュを積極的に削減してから続行
+  // メモリ圧力に応じたキャッシュ削減
   if (getIsCriticalMemory()) {
     evictExpired();
     trimToHalf();
   } else if (lowMem) {
-    // Low メモリ時は期限切れエントリだけ削除
     evictExpired();
   }
 
@@ -95,13 +113,13 @@ async function request(
   }
 
   const cacheKey = getCacheKey(endpoint, params);
-  const reqKey = _requestKey(endpoint, params);
+  const reqKey   = _requestKey(endpoint, params);
 
   if (useCache) {
     const hit = memGet(cacheKey);
     if (hit) {
       if (hit.expired && !lowMem) {
-        // SWR: LowMemory でなければバックグラウンド再取得
+        // SWR: 期限切れでも即座に返し、バックグラウンドで更新
         enqueue(async () => {
           const r = await fetchWithRetry(url.toString(), _fetchOpts, reqKey);
           if (r.ok) {
@@ -113,17 +131,16 @@ async function request(
       return { ok: true, data: hit.data, cached: true, stale: hit.expired };
     }
 
-    // LowMemory 時は永続キャッシュからのみ復元してメモリへの書き戻しはしない
     if (usePersistentCache) {
       const pData = await getP(cacheKey);
       if (pData) {
-        if (!lowMem) memSet(cacheKey, pData); // Low 時はメモリへ展開しない
+        // LowMemory 時は永続キャッシュからのみ復元、メモリ展開なし
+        if (!lowMem) memSet(cacheKey, pData);
         return { ok: true, data: pData, cached: true, persistent: true };
       }
     }
   }
 
-  // 同一リクエストの重複排除
   const existing = inFlight.get(reqKey);
   if (existing) return existing;
 
@@ -137,7 +154,6 @@ async function request(
           onChunk ?? undefined
         );
         if (result.ok && useCache && !result.streamed) {
-          // LowMemory 時はメモリキャッシュに書き込まない
           if (!lowMem) memSet(cacheKey, result.data);
           if (usePersistentCache) await setP(cacheKey, result.data);
         }
@@ -145,7 +161,6 @@ async function request(
       } catch (e) {
         reject(e);
       } finally {
-        // 完了後は必ず in-flight から削除してメモリを解放
         inFlight.delete(reqKey);
       }
     }, priority);
@@ -155,18 +170,13 @@ async function request(
   return promise;
 }
 
-// 毎回オブジェクトを生成しないよう共有定数として凍結
 const _fetchOpts: RequestInit = Object.freeze({
   method: "GET",
   headers: Object.freeze({ Accept: "application/json" }),
 });
 
-/**
- * 次ページを先読みする。
- * LowMemory 時はプリフェッチを完全停止してキャッシュを膨らませない。
- */
 function _prefetch(endpoint: string, params: Record<string, unknown>): void {
-  if (getIsLowMemory()) return; // LowMemory 時は停止
+  if (getIsLowMemory()) return;
   const cacheKey = getCacheKey(endpoint, params);
   const hit = memGet(cacheKey);
   if (hit && !hit.expired) return;
@@ -174,6 +184,13 @@ function _prefetch(endpoint: string, params: Record<string, unknown>): void {
   request(endpoint, params, { priority: Priority.LOW }).catch(() => {});
 }
 
+// ---- パブリック API ─────────────────────────────────────
+
+/**
+ * 小・中規模検索―レスポンス全体を取得しキャッシュする。
+ * metaOnly = true のときはメタ情報だけ抽出して返す（メモリ節約）。
+ * 詳細データは fetchDetail() で遅延取得する。
+ */
 export async function search({
   q,
   page = 1,
@@ -183,22 +200,111 @@ export async function search({
   enableStreaming = false,
   onChunk,
   usePersistentCache = false,
+  metaOnly = false,
 }: SearchOptions): Promise<FetchResult> {
   if (!q?.trim()) return { ok: false, error: "empty_query" };
 
+  const lowMem = getIsLowMemory();
+  const isHeavy = HEAVY_TYPES.has(type);
+  // 大規模コンテンツ or 高負荷状態は強制ストリーミング
+  const forceStream = isHeavy && lowMem;
+
   const params = { q: q.trim(), page, type, safesearch, lang };
 
-  // LowMemory 時はプリフェッチ停止・ストリーミング停止
-  if (type !== "suggest" && page < 10 && !getIsLowMemory()) {
+  // LowMemory 時はプリフェッチ停止
+  if (type !== "suggest" && page < 10 && !lowMem) {
     _prefetch("/search", { ...params, page: page + 1 });
   }
 
-  return request("/search", params, {
+  // ---- ストリーミングモード（大規模 or 高負荷） ----
+  if (forceStream || (enableStreaming && !lowMem && onChunk)) {
+    const metaBuf: ResultMeta[] = [];
+    const streamChunk = (chunk: unknown): void => {
+      const m = chunkToMeta(chunk);
+      if (m) metaBuf.push(m);
+      onChunk?.(chunk);          // 元の onChunk も呼ぶ
+    };
+
+    const result = await request("/search", params, {
+      priority: Priority.NORMAL,
+      onChunk: streamChunk,
+      usePersistentCache,
+    });
+
+    // ストリーミング中はメモリキャッシュに書き込まない（すでに retry.ts 内でブロック済み）
+    return result;
+  }
+
+  // ---- 通常モード ----
+  const result = await request("/search", params, {
     priority: type === "suggest" ? Priority.HIGH : Priority.NORMAL,
-    onChunk: enableStreaming && !getIsLowMemory() ? onChunk : null,
+    onChunk: null,
     usePersistentCache,
   });
+
+  if (!result.ok) return result;
+
+  // metaOnly: 必要最小限のフィールドだけ抽出して返す
+  if (metaOnly) {
+    const meta = extractMeta(result.data);
+    return { ...result, data: meta };
+  }
+
+  return result;
 }
+
+/**
+ * メタ情報のみを先に取得するショートハンド。
+ * リスト画面の高速描画に使う。
+ *
+ * @example
+ * const { data: meta } = await searchMeta({ q: "cats", type: "image" });
+ * // ユーザーがクリックしたときに詳細を取得
+ * const detail = await fetchDetail({ q: "cats", type: "image" }, 3);
+ */
+export function searchMeta(
+  opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">
+): Promise<FetchResult> {
+  return search({ ...opts, metaOnly: true });
+}
+
+/**
+ * キャッシュ済みレスポンスから指定インデックスの詳細データを取得する。
+ * ネットワークリクエストは発生しない（キャッシュ済みデータのみ使用）。
+ *
+ * @param opts 元の検索オプション（キャッシュキーの特定に使う）
+ * @param idx  results 配列のインデックス
+ */
+export async function fetchDetail(
+  opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">,
+  idx: number
+): Promise<ResultDetail | null> {
+  const { q, page = 1, type = "web", safesearch = 0, lang = "ja", usePersistentCache = false } = opts;
+  if (!q?.trim()) return null;
+
+  const params = { q: q.trim(), page, type, safesearch, lang };
+  const cacheKey = getCacheKey("/search", params);
+
+  // まずメモリキャッシュから
+  const hit = memGet(cacheKey);
+  if (hit) return extractDetail(hit.data, idx);
+
+  // 永続キャッシュから
+  if (usePersistentCache) {
+    const pData = await getP(cacheKey);
+    if (pData) return extractDetail(pData, idx);
+  }
+
+  // キャッシュなし→フル取得
+  const result = await request("/search", params, {
+    priority: Priority.NORMAL,
+    usePersistentCache,
+  });
+  if (!result.ok) return null;
+  return extractDetail(result.data, idx);
+}
+
+// ---- タイプ別ショートハンド -------------------------------------------
 
 export const searchWeb   = (q: string, page = 1): Promise<FetchResult> => search({ q, page, type: "web" });
 export const searchImage = (q: string, page = 1): Promise<FetchResult> => search({ q, page, type: "image" });
