@@ -48,32 +48,29 @@ export async function setP(key: string, data: unknown): Promise<void> {
   const cfg = getConfig();
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(["cache"], "readwrite");
-    // トランザクション自体のエラーも捕捉してリークを防ぐ
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
 
-    const store = tx.objectStore("cache");
-    const countReq = store.count();
+    const objectStore = tx.objectStore("cache");
+    const countReq = objectStore.count();
 
     countReq.onsuccess = () => {
       if (countReq.result >= cfg.PERSISTENT_CACHE_MAX) {
         const maxDel = Math.ceil(cfg.PERSISTENT_CACHE_MAX * 0.2);
-        const cur = store.index("time").openCursor(IDBKeyRange.lowerBound(0));
+        const cur = objectStore.index("time").openCursor(IDBKeyRange.lowerBound(0));
         let deleted = 0;
         cur.onsuccess = (e: Event) => {
           const c = (e.target as IDBRequest<IDBCursorWithValue | null>).result;
           if (c && deleted < maxDel) {
-            c.delete();
-            deleted++;
-            c.continue();
+            c.delete(); deleted++; c.continue();
           } else {
-            store.put({ data, time: Date.now() }, key);
+            objectStore.put({ data, time: Date.now() }, key);
             resolve();
           }
         };
         cur.onerror = () => reject(cur.error);
       } else {
-        store.put({ data, time: Date.now() }, key);
+        objectStore.put({ data, time: Date.now() }, key);
         tx.oncomplete = () => resolve();
       }
     };
@@ -98,7 +95,7 @@ export async function cleanup(): Promise<void> {
       if (c) { c.delete(); c.continue(); }
       else resolve();
     };
-    req.onerror = () => resolve(); // エラーでも resolve してブロックしない
+    req.onerror = () => resolve();
   });
 }
 

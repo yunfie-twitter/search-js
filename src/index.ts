@@ -1,9 +1,9 @@
 // src/index.ts
 import { configure, getConfig, type Config } from "./config.ts";
-import { store as memStore, clearStore } from "./cache/memory.ts";
+import { store as memStore, clearStore, evictExpired, trimToHalf } from "./cache/memory.ts";
 import { getCacheKey, get as memGet, set as memSet } from "./cache/memory.ts";
 import { getP, setP, cleanup, destroyDB } from "./cache/persistent.ts";
-import { initMemoryMonitor, getIsLowMemory, destroyMemoryMonitor } from "./memory.ts";
+import { initMemoryMonitor, getIsLowMemory, getIsCriticalMemory, destroyMemoryMonitor } from "./memory.ts";
 import { enqueue, Priority, clearQueues, type PriorityValue } from "./request/queue.ts";
 import { fetchWithRetry, cancel as cancelRequest, cancelAll, type FetchResult } from "./request/retry.ts";
 import { debounce } from "./utils.ts";
@@ -34,44 +34,35 @@ let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 export function init(options: Partial<Config> = {}): void {
   configure(options);
   initMemoryMonitor(memStore);
-
-  // 既存タイマーをクリアして多重登録を防ぐ
-  if (_cleanupTimer !== null) {
-    clearInterval(_cleanupTimer);
-  }
+  if (_cleanupTimer !== null) clearInterval(_cleanupTimer);
   _cleanupTimer = setInterval(cleanup, getConfig().PERSISTENT_CLEANUP_INTERVAL);
 }
 
 /**
  * 全リソースを解放する。
- * SPA のルート切り替えやテスト後に呼ぶことでメモリリークを防ぐ。
+ * SPA のルート切り替えや React の useEffect cleanup で呼ぶことでメモリリークを完全防止。
  */
 export async function destroy(): Promise<void> {
-  // 進行中リクエストを全キャンセル
-  cancelAll();
-  // キューをクリア
-  clearQueues();
-  // in-flight マップをクリア
-  inFlight.clear();
-  // メモリキャッシュをクリア
-  clearStore();
-  // IndexedDB 接続を閉じる
-  await destroyDB();
-  // モニタータイマーを停止
-  destroyMemoryMonitor();
-  // クリーンアップタイマーを停止
+  cancelAll();           // 進行中の全リクエストをキャンセル
+  clearQueues();         // 待機中タスクを破棄
+  inFlight.clear();      // in-flight 重複排除マップをクリア
+  clearStore();          // メモリキャッシュをクリア
+  await destroyDB();     // IndexedDB 接続を閉じる
+  destroyMemoryMonitor(); // タイマーを停止
   if (_cleanupTimer !== null) {
     clearInterval(_cleanupTimer);
     _cleanupTimer = null;
   }
 }
 
-// In-flight deduplication
+// ── In-flight 重複排除 ────────────────────────────────────────────
+// 同じクエリが同時に複数発行された場合、1 つの Promise を共有して
+// 無駄なネットワークリクエストとメモリ消費を防ぐ。
 const inFlight = new Map<string, Promise<FetchResult>>();
 
 function _requestKey(endpoint: string, params: Record<string, unknown>): string {
-  const { q, page, type } = params as { q?: string; page?: number; type?: string };
-  return `${endpoint}?q=${encodeURIComponent(q ?? "")}&page=${page ?? 1}&type=${type ?? "web"}`;
+  const p = params as { q?: string; page?: number; type?: string };
+  return endpoint + "\x00" + (p.q ?? "") + "\x00" + (p.page ?? 1) + "\x00" + (p.type ?? "web");
 }
 
 async function request(
@@ -85,10 +76,23 @@ async function request(
   }: RequestOptions = {}
 ): Promise<FetchResult> {
   const cfg = getConfig();
+  const lowMem = getIsLowMemory();
+
+  // Critical メモリ時はキャッシュを積極的に削減してから続行
+  if (getIsCriticalMemory()) {
+    evictExpired();
+    trimToHalf();
+  } else if (lowMem) {
+    // Low メモリ時は期限切れエントリだけ削除
+    evictExpired();
+  }
+
   const url = new URL(cfg.API_BASE + endpoint);
-  Object.entries(params).forEach(([k, v]) => {
-    if (v != null) url.searchParams.append(k, String(v));
-  });
+  const sp = url.searchParams;
+  for (const k in params) {
+    const v = params[k];
+    if (v != null) sp.append(k, String(v));
+  }
 
   const cacheKey = getCacheKey(endpoint, params);
   const reqKey = _requestKey(endpoint, params);
@@ -96,10 +100,10 @@ async function request(
   if (useCache) {
     const hit = memGet(cacheKey);
     if (hit) {
-      if (hit.expired) {
-        // SWR: バックグラウンド再取得（エラーは握りつぶさず console に流す）
+      if (hit.expired && !lowMem) {
+        // SWR: LowMemory でなければバックグラウンド再取得
         enqueue(async () => {
-          const r = await fetchWithRetry(url.toString(), _fetchOpts(), reqKey);
+          const r = await fetchWithRetry(url.toString(), _fetchOpts, reqKey);
           if (r.ok) {
             memSet(cacheKey, r.data);
             if (usePersistentCache) await setP(cacheKey, r.data);
@@ -109,15 +113,17 @@ async function request(
       return { ok: true, data: hit.data, cached: true, stale: hit.expired };
     }
 
+    // LowMemory 時は永続キャッシュからのみ復元してメモリへの書き戻しはしない
     if (usePersistentCache) {
       const pData = await getP(cacheKey);
       if (pData) {
-        memSet(cacheKey, pData);
+        if (!lowMem) memSet(cacheKey, pData); // Low 時はメモリへ展開しない
         return { ok: true, data: pData, cached: true, persistent: true };
       }
     }
   }
 
+  // 同一リクエストの重複排除
   const existing = inFlight.get(reqKey);
   if (existing) return existing;
 
@@ -126,19 +132,20 @@ async function request(
       try {
         const result = await fetchWithRetry(
           url.toString(),
-          _fetchOpts(),
+          _fetchOpts,
           reqKey,
           onChunk ?? undefined
         );
         if (result.ok && useCache && !result.streamed) {
-          memSet(cacheKey, result.data);
+          // LowMemory 時はメモリキャッシュに書き込まない
+          if (!lowMem) memSet(cacheKey, result.data);
           if (usePersistentCache) await setP(cacheKey, result.data);
         }
         resolve(result);
       } catch (e) {
         reject(e);
       } finally {
-        // 完了後は必ず in-flight から削除してリークを防ぐ
+        // 完了後は必ず in-flight から削除してメモリを解放
         inFlight.delete(reqKey);
       }
     }, priority);
@@ -148,12 +155,18 @@ async function request(
   return promise;
 }
 
-function _fetchOpts(): RequestInit {
-  return { method: "GET", headers: { Accept: "application/json" } };
-}
+// 毎回オブジェクトを生成しないよう共有定数として凍結
+const _fetchOpts: RequestInit = Object.freeze({
+  method: "GET",
+  headers: Object.freeze({ Accept: "application/json" }),
+});
 
+/**
+ * 次ページを先読みする。
+ * LowMemory 時はプリフェッチを完全停止してキャッシュを膨らませない。
+ */
 function _prefetch(endpoint: string, params: Record<string, unknown>): void {
-  if (getIsLowMemory()) return;
+  if (getIsLowMemory()) return; // LowMemory 時は停止
   const cacheKey = getCacheKey(endpoint, params);
   const hit = memGet(cacheKey);
   if (hit && !hit.expired) return;
@@ -175,6 +188,7 @@ export async function search({
 
   const params = { q: q.trim(), page, type, safesearch, lang };
 
+  // LowMemory 時はプリフェッチ停止・ストリーミング停止
   if (type !== "suggest" && page < 10 && !getIsLowMemory()) {
     _prefetch("/search", { ...params, page: page + 1 });
   }
