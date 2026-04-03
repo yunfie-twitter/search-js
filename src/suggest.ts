@@ -288,7 +288,7 @@ export function getSuggestDebounced(
         );
     };
 
-    // 🔥 正しい呼び方
+    //  正しい呼び方
     _debouncedFns.set(
       delay,
       debounce(fn, delay, false) as (q: string, cb: (r: SuggestResult) => void) => void
