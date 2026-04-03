@@ -36,6 +36,7 @@ export async function fetchWithRetry(
 
   for (let attempt = 0; attempt <= cfg.RETRIES; attempt++) {
     const ctrl = canAbort ? new AbortController() : null;
+    // 同一キーの前回リクエストをキャンセルして重複を防ぐ
     controllers.get(key)?.abort();
     if (ctrl) controllers.set(key, ctrl);
 
@@ -58,7 +59,6 @@ export async function fetchWithRetry(
         return await _readStream(res.body, ctrl, onChunk!, cfg);
       }
 
-      // JSON パースを arrayBuffer 経由にして TextDecoder で一度に処理（再割り当て同期を削減）
       return { ok: true, data: await res.json() };
 
     } catch (err) {
@@ -71,7 +71,6 @@ export async function fetchWithRetry(
         }
         if (err instanceof TypeError) {
           if (attempt === cfg.RETRIES) return { ok: false, error: "network_error" };
-          // エクスポネンシャルバックオフ（ジッターなし定数倍のみ）
           await _sleep(cfg.RETRY_BACKOFF_BASE * 2 ** attempt);
           continue;
         }
@@ -83,10 +82,13 @@ export async function fetchWithRetry(
   return { ok: false, error: "max_retries_exceeded" };
 }
 
-// 再利用可能な sleep
 const _sleep = (ms: number): Promise<void> =>
   new Promise<void>((r) => setTimeout(r, ms));
 
+/**
+ * ストリームを読み取り、JSON オブジェクトを逐次コールバックに渡す。
+ * finally ブロックで必ずリーダーロックと参照を解放してメモリリークを防ぐ。
+ */
 async function _readStream(
   body: ReadableStream<Uint8Array>,
   ctrl: AbortController | null,
@@ -95,10 +97,14 @@ async function _readStream(
 ): Promise<FetchResult> {
   const reader = body.getReader();
   const dec = new TextDecoder();
-  // チャンクを配列で蓄積、最後にスプレッドすることで GC プレッシャーを軽減
-  let buf = "", braces = 0, inStr = false, esc = false, aborted = false;
+  let buf = "";
+  let braces = 0;
+  let inStr = false;
+  let esc = false;
+  let aborted = false;
   const chunks: unknown[] = [];
 
+  // { once: true } でリスナー自身がメモリに残らないようにする
   const onAbort = (): void => { aborted = true; void reader.cancel(); };
   ctrl?.signal.addEventListener("abort", onAbort, { once: true });
 
@@ -111,9 +117,10 @@ async function _readStream(
     }
     if (!aborted) _flush();
   } finally {
+    // ストリーム完了後は必ずロックと参照を解放
     reader.releaseLock();
     ctrl?.signal.removeEventListener("abort", onAbort);
-    buf = "";
+    buf = ""; // バッファを明示的に解放
   }
 
   return {
@@ -137,7 +144,7 @@ async function _readStream(
             const obj: unknown = JSON.parse(buf.slice(start, i + 1));
             chunks.push(obj);
             onChunk(obj);
-          } catch { /* ignore malformed */ }
+          } catch { /* malformed JSON は無視 */ }
           buf = buf.slice(i + 1);
           i = -1;
         }
