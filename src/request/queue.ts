@@ -24,6 +24,8 @@ export function clearQueues(): void {
   _queues[0].length = 0;
   _queues[1].length = 0;
   _queues[2].length = 0;
+  // [MEDIUM #5 fix] destroy→init 後に _running が残っているとキューが詰まるのでリセット
+  _running = 0;
 }
 
 function _drain(): void {
@@ -33,7 +35,7 @@ function _drain(): void {
     const task = _queues[2].shift() ?? _queues[1].shift() ?? _queues[0].shift();
     if (!task) break;
     _running++;
-    // #3 fix: Promise.resolve() でラップして同期 throw も finally で捕捉する
+    // 同期 throw も finally で捕捉できるよう Promise.resolve() でラップ
     Promise.resolve()
       .then(() => task())
       .finally(() => { _running--; _drain(); });

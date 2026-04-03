@@ -9,9 +9,20 @@ export interface HistoryEntry {
   time: number;
 }
 
+// [MEDIUM #7 fix] Safari ITP/iframe sandbox では typeof チェックが通っても
+// 実際のアクセスで SecurityError が throw される。実際に読み書きしてテストする。
+let _available: boolean | null = null;
 function _isAvailable(): boolean {
-  try { return typeof localStorage !== "undefined"; }
-  catch { return false; }
+  if (_available !== null) return _available;
+  try {
+    const k = "__search_js_test__";
+    localStorage.setItem(k, "1");
+    localStorage.removeItem(k);
+    _available = true;
+  } catch {
+    _available = false;
+  }
+  return _available;
 }
 
 function _load(): HistoryEntry[] {

@@ -64,14 +64,16 @@ export async function setP(key: string, data: unknown): Promise<void> {
           if (c && deleted < maxDel) {
             c.delete(); deleted++; c.continue();
           } else {
+            // [LOW #10 fix] tx.oncomplete を put() より前に設定してから put する
+            tx.oncomplete = () => resolve();
             objectStore.put({ data, time: Date.now() }, key);
-            resolve();
           }
         };
         cur.onerror = () => reject(cur.error);
       } else {
-        objectStore.put({ data, time: Date.now() }, key);
+        // [LOW #10 fix] tx.oncomplete を put() より前に設定
         tx.oncomplete = () => resolve();
+        objectStore.put({ data, time: Date.now() }, key);
       }
     };
     countReq.onerror = () => reject(countReq.error);

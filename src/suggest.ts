@@ -58,8 +58,6 @@ function _cacheFindPrefix(q: string): SuggestCacheEntry | null {
 
   const now = Date.now();
   const ttl = getConfig().SUGGEST_TTL;
-
-  // #9 fix: イテレート中に _cache を変更しないよう TTL 切れキーを収集してから削除
   const expired: string[] = [];
 
   for (const [k, entry] of _cache) {
@@ -67,7 +65,6 @@ function _cacheFindPrefix(q: string): SuggestCacheEntry | null {
     if (key.startsWith(k)) {
       const filtered = entry.items.filter((item) => item.lower.includes(key));
       if (filtered.length > 0) {
-        // LRU 更新はループ後に行う
         for (const ek of expired) _cache.delete(ek);
         _cache.delete(k);
         _cache.set(k, { items: entry.items, time: entry.time });
@@ -75,7 +72,6 @@ function _cacheFindPrefix(q: string): SuggestCacheEntry | null {
       }
     }
   }
-
   for (const ek of expired) _cache.delete(ek);
   return null;
 }
@@ -107,7 +103,6 @@ async function _fetchSuggest(q: string): Promise<SuggestResult> {
 
   const promise = new Promise<SuggestResult>((resolve) => {
     const timeout = setTimeout(() => {
-      // #8 fix: timeout 発火時も _inFlight から削除して古い promise が再利用されないようにする
       _inFlight.delete(key);
       resolve({ ok: false, query: q, items: [], error: "timeout" });
     }, 5000);
@@ -181,48 +176,83 @@ export function getSuggest(q: string): Promise<SuggestResult> {
   return _fetchSuggest(q);
 }
 
-interface DebounceHandle {
-  timer: ReturnType<typeof setTimeout> | undefined;
+/* =========================
+ * createSuggestDebouncer
+ *
+ * [FREEZE #1 #2 fix]
+ * 旧実装: _handles をグローバル Map で delay 単位に共有
+ *   → 複数コンポーネントが同じ handle を競合、StrictMode で古い callback が残りフリーズ
+ *
+ * 新実装: 呼び出しごとに独立したタイマー状態を持つクロージャを返す
+ *   → コンポーネントごとに debouncer を作成し、unmount 時に cancel() を呼ぶだけでよい
+ *
+ * 使い方 (React):
+ *   const debouncer = useMemo(() => createSuggestDebouncer(), []);
+ *   useEffect(() => () => debouncer.cancel(), []);
+ *   // 入力時: debouncer.fetch(q, setSuggestions);
+ * ========================= */
+
+export interface SuggestDebouncer {
+  fetch(q: string, callback: (result: SuggestResult) => void): void;
+  cancel(): void;
 }
 
-const _handles = new Map<number, DebounceHandle>();
+export function createSuggestDebouncer(wait?: number): SuggestDebouncer {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  return {
+    fetch(q: string, callback: (result: SuggestResult) => void): void {
+      if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
+
+      if (!q.trim()) {
+        callback({ ok: true, query: q, items: [] });
+        return;
+      }
+
+      const delay = wait ?? getConfig().SUGGEST_DEBOUNCE_MS;
+      timer = setTimeout(() => {
+        timer = undefined;
+        getSuggest(q)
+          .then(callback)
+          .catch(() => callback({ ok: false, query: q, items: [], error: "unknown" }));
+      }, delay);
+    },
+    cancel(): void {
+      if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
+    },
+  };
+}
+
+/* =========================
+ * getSuggestDebounced (後方互換 API)
+ *
+ * グローバルな debouncer を delay ごとに1つ保持する。
+ * 単一コンポーネントでの使用に限り後方互換を維持。
+ * 複数コンポーネントで使う場合は createSuggestDebouncer() を使うこと。
+ * キャンセル関数を返すので useEffect の cleanup に渡せる。
+ * ========================= */
+const _globalDebouncers = new Map<number, SuggestDebouncer>();
 
 export function getSuggestDebounced(
   q: string,
   callback: (result: SuggestResult) => void,
   wait?: number
-): void {
+): () => void {
   const delay = wait ?? getConfig().SUGGEST_DEBOUNCE_MS;
 
-  let handle = _handles.get(delay);
-  if (!handle) {
-    handle = { timer: undefined };
-    _handles.set(delay, handle);
+  let debouncer = _globalDebouncers.get(delay);
+  if (!debouncer) {
+    debouncer = createSuggestDebouncer(delay);
+    _globalDebouncers.set(delay, debouncer);
   }
 
-  if (handle.timer !== undefined) {
-    clearTimeout(handle.timer);
-    handle.timer = undefined;
-  }
+  debouncer.fetch(q, callback);
 
-  if (!q.trim()) {
-    callback({ ok: true, query: q, items: [] });
-    return;
-  }
-
-  handle.timer = setTimeout(() => {
-    handle!.timer = undefined;
-    getSuggest(q)
-      .then(callback)
-      .catch(() =>
-        callback({ ok: false, query: q, items: [], error: "unknown" })
-      );
-  }, delay);
+  // キャンセル関数を返す → useEffect の return に渡せる
+  return () => debouncer!.cancel();
 }
 
 export function clearSuggestDebouncers(): void {
-  for (const h of _handles.values()) {
-    if (h.timer !== undefined) clearTimeout(h.timer);
-  }
-  _handles.clear();
+  for (const d of _globalDebouncers.values()) d.cancel();
+  _globalDebouncers.clear();
 }

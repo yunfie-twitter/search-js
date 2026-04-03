@@ -33,23 +33,24 @@ export async function fetchWithRetry(
   const cfg = getConfig();
   const canAbort = typeof AbortController !== "undefined";
   const canStream = typeof ReadableStream !== "undefined" && !!onChunk;
+  const externalSignal = opts.signal as AbortSignal | undefined;
 
   for (let attempt = 0; attempt <= cfg.RETRIES; attempt++) {
-    // 前の attempt の ctrl を必ず削除してから新しい ctrl を登録
     controllers.get(key)?.abort();
     controllers.delete(key);
 
     const ctrl = canAbort ? new AbortController() : null;
     if (ctrl) controllers.set(key, ctrl);
 
-    const externalSignal = opts.signal as AbortSignal | undefined;
+    // [HIGH #3 fix] bridge を変数に保持して finally で必ず removeEventListener する
+    let bridge: (() => void) | undefined;
     let mergedSignal: AbortSignal | undefined;
 
     if (ctrl && externalSignal) {
       if (typeof AbortSignal.any === "function") {
         mergedSignal = AbortSignal.any([ctrl.signal, externalSignal]);
       } else {
-        const bridge = (): void => ctrl.abort();
+        bridge = (): void => ctrl.abort();
         externalSignal.addEventListener("abort", bridge, { once: true });
         mergedSignal = ctrl.signal;
       }
@@ -58,12 +59,15 @@ export async function fetchWithRetry(
     }
 
     const fetchOpts: RequestInit = mergedSignal ? { ...opts, signal: mergedSignal } : opts;
-    const tid = ctrl ? setTimeout(() => ctrl.abort(), cfg.TIMEOUT) : undefined;
+    // [HIGH #4 fix] tid を attempt スコープ内に閉じ込める
+    let tid: ReturnType<typeof setTimeout> | undefined;
+    if (ctrl) tid = setTimeout(() => ctrl.abort(), cfg.TIMEOUT);
 
     try {
       const res = await fetch(url, fetchOpts);
       clearTimeout(tid);
-      // 成功時は必ず削除
+      // bridge が登録されていれば解除
+      if (bridge && externalSignal) externalSignal.removeEventListener("abort", bridge);
       controllers.delete(key);
 
       if (!res.ok) {
@@ -79,7 +83,7 @@ export async function fetchWithRetry(
 
     } catch (err) {
       clearTimeout(tid);
-      // エラー時も必ず削除（リトライする場合もループ先頭で再登録される）
+      if (bridge && externalSignal) externalSignal.removeEventListener("abort", bridge);
       controllers.delete(key);
 
       if (err instanceof Error) {
@@ -126,7 +130,6 @@ async function _readStream(
       catch { break outer; }
       if (readResult.done) break;
       buf += dec.decode(readResult.value, { stream: true });
-      // #2 fix: aborted チェックを追加して二重 _flush を防止
       if (!aborted && buf.length > cfg.STREAMING_BUFFER_SIZE) _flush();
     }
     if (!aborted) _flush();
