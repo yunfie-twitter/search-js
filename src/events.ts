@@ -1,5 +1,5 @@
 // src/events.ts
-// 軽量イベントエミッター（完全版）
+// 軽量イベントエミッター
 
 export type SearchEventMap = {
   memoryStateChange: { isLow: boolean; isCritical: boolean };
