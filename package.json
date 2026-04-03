@@ -1,5 +1,5 @@
 {
-  "name": "search-js",
+  "name": "search",
   "version": "1.0.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -10,13 +10,30 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist", "src"],
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch"
   },
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "typescript": "^5.9.3"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "description": "",
+  "directories": {
+    "doc": "docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yunfie-twitter/search-js.git"
+  },
+  "keywords": [],
+  "author": "yunfie",
+  "bugs": {
+    "url": "https://github.com/yunfie-twitter/search-js/issues"
+  },
+  "homepage": "https://github.com/yunfie-twitter/search-js#readme"
 }
