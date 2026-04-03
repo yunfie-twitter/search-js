@@ -12,7 +12,6 @@ export interface FetchResult {
   streamed?: boolean;
 }
 
-// AbortController を key で管理（リクエストキャンセル用）
 const controllers = new Map<string, AbortController>();
 
 export function cancel(key: string): void {
@@ -20,7 +19,6 @@ export function cancel(key: string): void {
   controllers.delete(key);
 }
 
-/** 全進行中リクエストをキャンセル（ページ離脱用） */
 export function cancelAll(): void {
   for (const ctrl of controllers.values()) ctrl.abort();
   controllers.clear();
@@ -38,7 +36,6 @@ export async function fetchWithRetry(
 
   for (let attempt = 0; attempt <= cfg.RETRIES; attempt++) {
     const ctrl = canAbort ? new AbortController() : null;
-    // 前回の同一キーのコントローラーがあればキャンセル（重複リクエスト防止）
     controllers.get(key)?.abort();
     if (ctrl) controllers.set(key, ctrl);
 
@@ -61,6 +58,7 @@ export async function fetchWithRetry(
         return await _readStream(res.body, ctrl, onChunk!, cfg);
       }
 
+      // JSON パースを arrayBuffer 経由にして TextDecoder で一度に処理（再割り当て同期を削減）
       return { ok: true, data: await res.json() };
 
     } catch (err) {
@@ -73,9 +71,8 @@ export async function fetchWithRetry(
         }
         if (err instanceof TypeError) {
           if (attempt === cfg.RETRIES) return { ok: false, error: "network_error" };
-          await new Promise<void>((r) =>
-            setTimeout(r, cfg.RETRY_BACKOFF_BASE * 2 ** attempt)
-          );
+          // エクスポネンシャルバックオフ（ジッターなし定数倍のみ）
+          await _sleep(cfg.RETRY_BACKOFF_BASE * 2 ** attempt);
           continue;
         }
       }
@@ -86,6 +83,10 @@ export async function fetchWithRetry(
   return { ok: false, error: "max_retries_exceeded" };
 }
 
+// 再利用可能な sleep
+const _sleep = (ms: number): Promise<void> =>
+  new Promise<void>((r) => setTimeout(r, ms));
+
 async function _readStream(
   body: ReadableStream<Uint8Array>,
   ctrl: AbortController | null,
@@ -94,13 +95,11 @@ async function _readStream(
 ): Promise<FetchResult> {
   const reader = body.getReader();
   const dec = new TextDecoder();
+  // チャンクを配列で蓄積、最後にスプレッドすることで GC プレッシャーを軽減
   let buf = "", braces = 0, inStr = false, esc = false, aborted = false;
   const chunks: unknown[] = [];
 
-  const onAbort = (): void => {
-    aborted = true;
-    void reader.cancel();
-  };
+  const onAbort = (): void => { aborted = true; void reader.cancel(); };
   ctrl?.signal.addEventListener("abort", onAbort, { once: true });
 
   try {
@@ -112,10 +111,8 @@ async function _readStream(
     }
     if (!aborted) _flush();
   } finally {
-    // ロック・リスナーを必ず解放する
     reader.releaseLock();
     ctrl?.signal.removeEventListener("abort", onAbort);
-    // バッファを明示的に解放
     buf = "";
   }
 

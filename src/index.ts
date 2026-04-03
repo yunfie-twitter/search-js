@@ -34,32 +34,17 @@ let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 export function init(options: Partial<Config> = {}): void {
   configure(options);
   initMemoryMonitor(memStore);
-
-  // 既存タイマーをクリアして多重登録を防ぐ
-  if (_cleanupTimer !== null) {
-    clearInterval(_cleanupTimer);
-  }
+  if (_cleanupTimer !== null) clearInterval(_cleanupTimer);
   _cleanupTimer = setInterval(cleanup, getConfig().PERSISTENT_CLEANUP_INTERVAL);
 }
 
-/**
- * 全リソースを解放する。
- * SPA のルート切り替えやテスト後に呼ぶことでメモリリークを防ぐ。
- */
 export async function destroy(): Promise<void> {
-  // 進行中リクエストを全キャンセル
   cancelAll();
-  // キューをクリア
   clearQueues();
-  // in-flight マップをクリア
   inFlight.clear();
-  // メモリキャッシュをクリア
   clearStore();
-  // IndexedDB 接続を閉じる
   await destroyDB();
-  // モニタータイマーを停止
   destroyMemoryMonitor();
-  // クリーンアップタイマーを停止
   if (_cleanupTimer !== null) {
     clearInterval(_cleanupTimer);
     _cleanupTimer = null;
@@ -69,11 +54,13 @@ export async function destroy(): Promise<void> {
 // In-flight deduplication
 const inFlight = new Map<string, Promise<FetchResult>>();
 
+// リクエストキー: 最小限の文字列連結でハッシュ計算コストを削減
 function _requestKey(endpoint: string, params: Record<string, unknown>): string {
-  const { q, page, type } = params as { q?: string; page?: number; type?: string };
-  return `${endpoint}?q=${encodeURIComponent(q ?? "")}&page=${page ?? 1}&type=${type ?? "web"}`;
+  const p = params as { q?: string; page?: number; type?: string };
+  return endpoint + "\x00" + (p.q ?? "") + "\x00" + (p.page ?? 1) + "\x00" + (p.type ?? "web");
 }
 
+// URL 構築を高速化: entries() ループを減らし直接 append
 async function request(
   endpoint: string,
   params: Record<string, unknown> = {},
@@ -86,9 +73,11 @@ async function request(
 ): Promise<FetchResult> {
   const cfg = getConfig();
   const url = new URL(cfg.API_BASE + endpoint);
-  Object.entries(params).forEach(([k, v]) => {
-    if (v != null) url.searchParams.append(k, String(v));
-  });
+  const sp = url.searchParams;
+  for (const k in params) {
+    const v = params[k];
+    if (v != null) sp.append(k, String(v));
+  }
 
   const cacheKey = getCacheKey(endpoint, params);
   const reqKey = _requestKey(endpoint, params);
@@ -97,9 +86,8 @@ async function request(
     const hit = memGet(cacheKey);
     if (hit) {
       if (hit.expired) {
-        // SWR: バックグラウンド再取得（エラーは握りつぶさず console に流す）
         enqueue(async () => {
-          const r = await fetchWithRetry(url.toString(), _fetchOpts(), reqKey);
+          const r = await fetchWithRetry(url.toString(), _fetchOpts, reqKey);
           if (r.ok) {
             memSet(cacheKey, r.data);
             if (usePersistentCache) await setP(cacheKey, r.data);
@@ -126,7 +114,7 @@ async function request(
       try {
         const result = await fetchWithRetry(
           url.toString(),
-          _fetchOpts(),
+          _fetchOpts,
           reqKey,
           onChunk ?? undefined
         );
@@ -138,7 +126,6 @@ async function request(
       } catch (e) {
         reject(e);
       } finally {
-        // 完了後は必ず in-flight から削除してリークを防ぐ
         inFlight.delete(reqKey);
       }
     }, priority);
@@ -148,9 +135,11 @@ async function request(
   return promise;
 }
 
-function _fetchOpts(): RequestInit {
-  return { method: "GET", headers: { Accept: "application/json" } };
-}
+// 毎回オブジェクト生成しないよう定数として共有
+const _fetchOpts: RequestInit = Object.freeze({
+  method: "GET",
+  headers: Object.freeze({ Accept: "application/json" }),
+});
 
 function _prefetch(endpoint: string, params: Record<string, unknown>): void {
   if (getIsLowMemory()) return;

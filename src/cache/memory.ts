@@ -4,7 +4,6 @@ import { getCurrentCacheMax } from "../memory.ts";
 
 interface CacheItem {
   time: number;
-  /** 小さいデータは JSON 文字列で保持、大きいデータはオブジェクトのまま */
   data: string | unknown;
   parsed?: unknown;
 }
@@ -16,31 +15,30 @@ interface CacheHit {
 
 export const store = new Map<string, CacheItem>();
 
+// キャッシュキーの生成: URLSearchParams を避けシンプルな文字列連結にして高速化
+const _SEP = "\x00";
 export function getCacheKey(endpoint: string, params: Record<string, unknown>): string {
-  return endpoint + "?" + new URLSearchParams(
-    Object.fromEntries(
-      Object.entries(params)
-        .filter(([, v]) => v != null)
-        .map(([k, v]) => [k, String(v)])
-    )
-  ).toString();
+  // キーをソートして問わず同じキーになるようにする
+  const sorted = Object.keys(params).sort();
+  let key = endpoint;
+  for (const k of sorted) {
+    const v = params[k];
+    if (v != null) key += _SEP + k + "=" + String(v);
+  }
+  return key;
 }
 
 export function get(key: string): CacheHit | null {
   const item = store.get(key);
   if (!item) return null;
 
-  // LRU 更新
+  // LRU: delete+set は Map の振る舞い上最新になる
   store.delete(key);
   store.set(key, item);
 
-  // 遅延 JSON パース（パース済みなら再利用）
   if (typeof item.data === "string" && item.parsed === undefined) {
-    try {
-      item.parsed = JSON.parse(item.data);
-    } catch {
-      item.parsed = item.data;
-    }
+    try { item.parsed = JSON.parse(item.data); }
+    catch { item.parsed = item.data; }
   }
 
   return {
@@ -54,14 +52,13 @@ export function set(key: string, data: unknown): void {
   const max = getCurrentCacheMax();
 
   if (store.has(key)) store.delete(key);
-
-  // 上限を超えたら古いエントリを削除（LRU eviction）
   while (store.size >= max) {
     const firstKey = store.keys().next().value;
     if (firstKey !== undefined) store.delete(firstKey);
     else break;
   }
 
+  // 小さいデータは JSON 文字列で保持して遅延パースを活用、大きいデータはオブジェクトのまま保持
   const jsonStr = typeof data === "string" ? data : JSON.stringify(data);
   store.set(key, {
     time: Date.now(),
@@ -69,7 +66,6 @@ export function set(key: string, data: unknown): void {
   });
 }
 
-/** キャッシュを完全にクリアする（メモリ解放・テスト用） */
 export function clearStore(): void {
   store.clear();
 }
