@@ -1,12 +1,12 @@
 // src/index.ts
-import { configure, getConfig, type Config } from "./config.js";
-import { store as memStore } from "./cache/memory.js";
-import { getCacheKey, get as memGet, set as memSet } from "./cache/memory.js";
-import { getP, setP, cleanup } from "./cache/persistent.js";
-import { initMemoryMonitor, getIsLowMemory } from "./memory.js";
-import { enqueue, Priority, type PriorityValue } from "./request/queue.js";
-import { fetchWithRetry, cancel as cancelRequest, type FetchResult } from "./request/retry.js";
-import { debounce } from "./utils.js";
+import { configure, getConfig, type Config } from "./config.ts";
+import { store as memStore } from "./cache/memory.ts";
+import { getCacheKey, get as memGet, set as memSet } from "./cache/memory.ts";
+import { getP, setP, cleanup } from "./cache/persistent.ts";
+import { initMemoryMonitor, getIsLowMemory } from "./memory.ts";
+import { enqueue, Priority, type PriorityValue } from "./request/queue.ts";
+import { fetchWithRetry, cancel as cancelRequest, type FetchResult } from "./request/retry.ts";
+import { debounce } from "./utils.ts";
 
 export { configure, debounce, cancelRequest };
 export type { Config, FetchResult };

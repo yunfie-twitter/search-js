@@ -1,5 +1,5 @@
 // src/memory.ts
-import { getConfig } from "./config.js";
+import { getConfig } from "./config.ts";
 
 interface Capabilities {
   performanceMemory: boolean;

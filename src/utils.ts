@@ -1,5 +1,5 @@
 // src/utils.ts
-import { getIsLowMemory } from "./memory.js";
+import { getIsLowMemory } from "./memory.ts";
 
 type AnyFunction = (...args: unknown[]) => unknown;
 

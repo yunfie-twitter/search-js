@@ -1,6 +1,6 @@
 // src/cache/memory.ts
-import { getConfig } from "../config.js";
-import { getCurrentCacheMax } from "../memory.js";
+import { getConfig } from "../config.ts";
+import { getCurrentCacheMax } from "../memory.ts";
 
 interface CacheItem {
   time: number;

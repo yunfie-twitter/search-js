@@ -1,5 +1,5 @@
 // src/cache/persistent.ts
-import { getConfig } from "../config.js";
+import { getConfig } from "../config.ts";
 
 let _dbPromise: Promise<IDBDatabase | null> | null = null;
 
