@@ -1,6 +1,6 @@
 // src/request/queue.ts
-import { getConfig } from "../config.js";
-import { getIsLowMemory } from "../memory.js";
+import { getConfig } from "../config.ts";
+import { getIsLowMemory } from "../memory.ts";
 
 export const Priority = Object.freeze({ HIGH: 0, NORMAL: 1, LOW: 2 } as const);
 export type PriorityValue = typeof Priority[keyof typeof Priority];

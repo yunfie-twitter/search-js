@@ -1,5 +1,5 @@
 // src/request/retry.ts
-import { getConfig } from "../config.js";
+import { getConfig } from "../config.ts";
 
 export interface FetchResult {
   ok: boolean;
