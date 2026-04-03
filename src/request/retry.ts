@@ -12,11 +12,18 @@ export interface FetchResult {
   streamed?: boolean;
 }
 
+// AbortController を key で管理（リクエストキャンセル用）
 const controllers = new Map<string, AbortController>();
 
 export function cancel(key: string): void {
   controllers.get(key)?.abort();
   controllers.delete(key);
+}
+
+/** 全進行中リクエストをキャンセル（ページ離脱用） */
+export function cancelAll(): void {
+  for (const ctrl of controllers.values()) ctrl.abort();
+  controllers.clear();
 }
 
 export async function fetchWithRetry(
@@ -31,13 +38,16 @@ export async function fetchWithRetry(
 
   for (let attempt = 0; attempt <= cfg.RETRIES; attempt++) {
     const ctrl = canAbort ? new AbortController() : null;
-    const tid = setTimeout(() => ctrl?.abort(), cfg.TIMEOUT);
+    // 前回の同一キーのコントローラーがあればキャンセル（重複リクエスト防止）
+    controllers.get(key)?.abort();
     if (ctrl) controllers.set(key, ctrl);
+
+    const tid = setTimeout(() => ctrl?.abort(), cfg.TIMEOUT);
 
     try {
       const res = await fetch(url, ctrl ? { ...opts, signal: ctrl.signal } : opts);
       clearTimeout(tid);
-      if (ctrl) { ctrl.signal.onabort = null; controllers.delete(key); }
+      controllers.delete(key);
 
       if (!res.ok) {
         return {
@@ -55,7 +65,7 @@ export async function fetchWithRetry(
 
     } catch (err) {
       clearTimeout(tid);
-      if (ctrl) { ctrl.signal.onabort = null; controllers.delete(key); }
+      controllers.delete(key);
 
       if (err instanceof Error) {
         if (err.name === "AbortError" || err.message?.includes("aborted")) {
@@ -63,7 +73,9 @@ export async function fetchWithRetry(
         }
         if (err instanceof TypeError) {
           if (attempt === cfg.RETRIES) return { ok: false, error: "network_error" };
-          await new Promise<void>((r) => setTimeout(r, cfg.RETRY_BACKOFF_BASE * 2 ** attempt));
+          await new Promise<void>((r) =>
+            setTimeout(r, cfg.RETRY_BACKOFF_BASE * 2 ** attempt)
+          );
           continue;
         }
       }
@@ -85,8 +97,11 @@ async function _readStream(
   let buf = "", braces = 0, inStr = false, esc = false, aborted = false;
   const chunks: unknown[] = [];
 
-  const onAbort = () => { aborted = true; void reader.cancel(); };
-  ctrl?.signal.addEventListener("abort", onAbort);
+  const onAbort = (): void => {
+    aborted = true;
+    void reader.cancel();
+  };
+  ctrl?.signal.addEventListener("abort", onAbort, { once: true });
 
   try {
     while (!aborted) {
@@ -97,9 +112,18 @@ async function _readStream(
     }
     if (!aborted) _flush();
   } finally {
+    // ロック・リスナーを必ず解放する
     reader.releaseLock();
     ctrl?.signal.removeEventListener("abort", onAbort);
+    // バッファを明示的に解放
+    buf = "";
   }
+
+  return {
+    ok: true,
+    data: chunks.length === 1 ? chunks[0] : chunks,
+    streamed: true,
+  };
 
   function _flush(): void {
     let start = 0;
@@ -123,6 +147,4 @@ async function _readStream(
       }
     }
   }
-
-  return { ok: true, data: chunks.length === 1 ? chunks[0] : chunks, streamed: true };
 }
