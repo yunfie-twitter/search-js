@@ -51,7 +51,6 @@ export async function fetchWithRetry(
         mergedSignal = ctrl.signal;
       }
     } else {
-      // ctrl が null なら undefined にする（null は RequestInit.signal に入らない）
       mergedSignal = ctrl?.signal ?? externalSignal ?? undefined;
     }
 
@@ -160,3 +159,4 @@ async function _readStream(
       }
     }
   }
+}
