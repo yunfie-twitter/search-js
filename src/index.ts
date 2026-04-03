@@ -84,8 +84,11 @@ export function getSearchStats(): SearchStats {
 }
 
 let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
+// #11 fix: destroy 済みフラグで SWR バックグラウンド fetch の後処理をガード
+let _destroyed = false;
 
 export function init(options: Partial<Config> = {}): void {
+  _destroyed = false;
   configure(options);
   initMemoryMonitor(memStore);
   initOfflineMonitor();
@@ -94,6 +97,7 @@ export function init(options: Partial<Config> = {}): void {
 }
 
 export async function destroy(): Promise<void> {
+  _destroyed = true;
   cancelAll();
   clearQueues();
   inFlight.clear();
@@ -149,6 +153,8 @@ async function request(
     if (hit) {
       if (hit.expired && !lowMem && !offline) {
         enqueue(async () => {
+          // #11 fix: destroy 済みなら SWR の書き戻しをスキップ
+          if (_destroyed) return;
           const r = await fetchWithRetry(url.toString(), _fetchOpts, reqKey);
           if (r.ok) {
             memSet(cacheKey, r.data);
@@ -234,7 +240,9 @@ export async function search({
   const isHeavy    = HEAVY_TYPES.has(type);
   const forceStream = isHeavy && lowMem;
   const params = { q: q.trim(), page, type, safesearch, lang };
-  if (page < 10 && !lowMem) _prefetch("/search", { ...params, page: page + 1 });
+  // #12 fix: プリフェッチ上限を Config から取得（将来の変更に追従）
+  const prefetchMaxPage = getConfig().CACHE_MAX; // 仮の上限、Config に PREFETCH_MAX_PAGE 追加時に差し替え
+  if (page < 10 && page < prefetchMaxPage && !lowMem) _prefetch("/search", { ...params, page: page + 1 });
   if (forceStream || (enableStreaming && onChunk)) {
     return request("/search", params, { priority: Priority.NORMAL, onChunk: onChunk ?? undefined, usePersistentCache, signal });
   }

@@ -1,5 +1,5 @@
 // src/memory.ts
-import { getConfig } from "./config.js";
+import { getConfig, defaults } from "./config.js";
 import { emit } from "./events.js";
 
 interface Capabilities {
@@ -18,7 +18,7 @@ const capabilities: Capabilities = {
 
 let isLowMemory = false;
 let isCriticalMemory = false;
-let currentCacheMax = 0;
+let currentCacheMax = defaults.CACHE_MAX; // #7 fix: 初期値を 0 ではなく defaults に
 let _monitorTimer: ReturnType<typeof setInterval> | null = null;
 
 export const getIsLowMemory = (): boolean => isLowMemory;
@@ -49,6 +49,8 @@ export function destroyMemoryMonitor(): void {
   }
   isLowMemory = false;
   isCriticalMemory = false;
+  // #7 fix: destroy 後に set() が呼ばれても無限ループしないようデフォルト値に戻す
+  currentCacheMax = defaults.CACHE_MAX;
 }
 
 function _check(cacheRef: Map<unknown, unknown>): void {
@@ -62,8 +64,9 @@ function _check(cacheRef: Map<unknown, unknown>): void {
     pressure = Math.max(pressure, (mem.usedJSHeapSize / mem.jsHeapSizeLimit) * 100);
   }
 
+  // #6 fix: 直値 65 を Config 定数と連動させる
   if (cacheRef.size > currentCacheMax * 0.85) {
-    pressure = Math.max(pressure, 65);
+    pressure = Math.max(pressure, cfg.MEMORY_PRESSURE_NORMAL * 100);
   }
 
   const prevLow      = isLowMemory;

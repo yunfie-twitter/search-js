@@ -35,7 +35,10 @@ export async function fetchWithRetry(
   const canStream = typeof ReadableStream !== "undefined" && !!onChunk;
 
   for (let attempt = 0; attempt <= cfg.RETRIES; attempt++) {
+    // 前の attempt の ctrl を必ず削除してから新しい ctrl を登録
     controllers.get(key)?.abort();
+    controllers.delete(key);
+
     const ctrl = canAbort ? new AbortController() : null;
     if (ctrl) controllers.set(key, ctrl);
 
@@ -60,6 +63,7 @@ export async function fetchWithRetry(
     try {
       const res = await fetch(url, fetchOpts);
       clearTimeout(tid);
+      // 成功時は必ず削除
       controllers.delete(key);
 
       if (!res.ok) {
@@ -75,6 +79,7 @@ export async function fetchWithRetry(
 
     } catch (err) {
       clearTimeout(tid);
+      // エラー時も必ず削除（リトライする場合もループ先頭で再登録される）
       controllers.delete(key);
 
       if (err instanceof Error) {
@@ -121,7 +126,8 @@ async function _readStream(
       catch { break outer; }
       if (readResult.done) break;
       buf += dec.decode(readResult.value, { stream: true });
-      if (buf.length > cfg.STREAMING_BUFFER_SIZE) _flush();
+      // #2 fix: aborted チェックを追加して二重 _flush を防止
+      if (!aborted && buf.length > cfg.STREAMING_BUFFER_SIZE) _flush();
     }
     if (!aborted) _flush();
   } finally {

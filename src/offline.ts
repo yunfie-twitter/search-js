@@ -28,6 +28,8 @@ export function destroyOfflineMonitor(): void {
 }
 
 export function addRetryTask(task: RetryTask): void {
+  // #10 fix: destroy 後は孤立タスクを追加しない
+  if (!_initialized) return;
   if (_pendingRetries.length < 50) _pendingRetries.push(task);
 }
 

@@ -4,10 +4,6 @@ import { getIsLowMemory } from "./memory.js";
 import { fetchWithRetry, type FetchResult } from "./request/retry.js";
 import { enqueue, Priority } from "./request/queue.js";
 
-/* =========================
- * 型
- * ========================= */
-
 export interface SuggestItem {
   title: string;
   lower: string;
@@ -25,10 +21,6 @@ interface SuggestCacheEntry {
   items: SuggestItem[];
   time: number;
 }
-
-/* =========================
- * キャッシュ
- * ========================= */
 
 const _cache = new Map<string, SuggestCacheEntry>();
 const SUGGEST_CACHE_MAX = 50;
@@ -67,27 +59,30 @@ function _cacheFindPrefix(q: string): SuggestCacheEntry | null {
   const now = Date.now();
   const ttl = getConfig().SUGGEST_TTL;
 
+  // #9 fix: イテレート中に _cache を変更しないよう TTL 切れキーを収集してから削除
+  const expired: string[] = [];
+
   for (const [k, entry] of _cache) {
-    if (now - entry.time > ttl) { _cache.delete(k); continue; }
+    if (now - entry.time > ttl) { expired.push(k); continue; }
     if (key.startsWith(k)) {
       const filtered = entry.items.filter((item) => item.lower.includes(key));
       if (filtered.length > 0) {
+        // LRU 更新はループ後に行う
+        for (const ek of expired) _cache.delete(ek);
         _cache.delete(k);
         _cache.set(k, { items: entry.items, time: entry.time });
         return { items: filtered, time: entry.time };
       }
     }
   }
+
+  for (const ek of expired) _cache.delete(ek);
   return null;
 }
 
 export function clearSuggestCache(): void {
   _cache.clear();
 }
-
-/* =========================
- * 通信制御
- * ========================= */
 
 const _inFlight = new Map<string, Promise<SuggestResult>>();
 
@@ -112,6 +107,8 @@ async function _fetchSuggest(q: string): Promise<SuggestResult> {
 
   const promise = new Promise<SuggestResult>((resolve) => {
     const timeout = setTimeout(() => {
+      // #8 fix: timeout 発火時も _inFlight から削除して古い promise が再利用されないようにする
+      _inFlight.delete(key);
       resolve({ ok: false, query: q, items: [], error: "timeout" });
     }, 5000);
 
@@ -142,10 +139,6 @@ async function _fetchSuggest(q: string): Promise<SuggestResult> {
   return promise;
 }
 
-/* =========================
- * パース
- * ========================= */
-
 function _parse(data: unknown): SuggestItem[] {
   return _toArray(data).reduce<SuggestItem[]>((acc, item) => {
     const title = _title(item);
@@ -175,10 +168,6 @@ function _toArray(data: unknown): unknown[] {
   return [];
 }
 
-/* =========================
- * 公開API
- * ========================= */
-
 export function getSuggest(q: string): Promise<SuggestResult> {
   if (!q.trim()) return Promise.resolve({ ok: true, query: q, items: [] });
   if (getIsLowMemory()) {
@@ -192,23 +181,10 @@ export function getSuggest(q: string): Promise<SuggestResult> {
   return _fetchSuggest(q);
 }
 
-/* =========================
- * getSuggestDebounced
- *
- * 【修正の核心】
- * 以前の実装: getSuggest() 自体を debounce → debounce がキャンセルした
- *   古い Promise の reject が callback に届かず、2回目以降でフリーズ。
- *
- * 修正後:「getSuggest を呼んで callback を実行する」関数全体を
- *   setTimeout ベースの素朴な debounce で包む。
- *   Promise を外に持ち出さないため pending/reject の競合が起きない。
- * ========================= */
-
 interface DebounceHandle {
   timer: ReturnType<typeof setTimeout> | undefined;
 }
 
-// delay ごとに handle を1つ保持（同一 wait の呼び出しは同じタイマーで debounce）
 const _handles = new Map<number, DebounceHandle>();
 
 export function getSuggestDebounced(
@@ -224,19 +200,16 @@ export function getSuggestDebounced(
     _handles.set(delay, handle);
   }
 
-  // 前のタイマーをキャンセル
   if (handle.timer !== undefined) {
     clearTimeout(handle.timer);
     handle.timer = undefined;
   }
 
-  // 空クエリは即座に空結果を返す
   if (!q.trim()) {
     callback({ ok: true, query: q, items: [] });
     return;
   }
 
-  // delay ms 後に fetch → callback
   handle.timer = setTimeout(() => {
     handle!.timer = undefined;
     getSuggest(q)
@@ -247,7 +220,6 @@ export function getSuggestDebounced(
   }, delay);
 }
 
-/** debounce タイマーをすべてクリア（destroy() 時に呼ぶ） */
 export function clearSuggestDebouncers(): void {
   for (const h of _handles.values()) {
     if (h.timer !== undefined) clearTimeout(h.timer);

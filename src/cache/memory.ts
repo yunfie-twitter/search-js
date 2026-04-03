@@ -59,11 +59,14 @@ export function set(key: string, data: unknown): void {
 }
 
 export function evictExpired(): void {
+  // #4 fix: イテレート中に Map を変更しないよう削除キーを先に収集する
   const ttl = getConfig().CACHE_TTL;
   const now = Date.now();
+  const toDelete: string[] = [];
   for (const [key, item] of store) {
-    if (now - item.time > ttl) store.delete(key);
+    if (now - item.time > ttl) toDelete.push(key);
   }
+  for (const key of toDelete) store.delete(key);
 }
 
 export function trimToHalf(): void {

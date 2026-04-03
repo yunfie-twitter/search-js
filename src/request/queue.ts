@@ -33,6 +33,9 @@ function _drain(): void {
     const task = _queues[2].shift() ?? _queues[1].shift() ?? _queues[0].shift();
     if (!task) break;
     _running++;
-    task().finally(() => { _running--; _drain(); });
+    // #3 fix: Promise.resolve() でラップして同期 throw も finally で捕捉する
+    Promise.resolve()
+      .then(() => task())
+      .finally(() => { _running--; _drain(); });
   }
 }
