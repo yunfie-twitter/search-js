@@ -11,15 +11,22 @@ import {
   extractMeta, extractDetail, chunkToMeta,
   type ResultMeta, type ResultDetail, type ParsedResponse,
 } from "./parser.ts";
+import {
+  getSuggest as _getSuggest,
+  getSuggestDebounced,
+  clearSuggestCache,
+  type SuggestItem,
+  type SuggestResult,
+} from "./suggest.ts";
 
-export { configure, debounce, cancelRequest, cancelAll };
-export type { Config, FetchResult, ResultMeta, ResultDetail, ParsedResponse };
+export { configure, debounce, cancelRequest, cancelAll, getSuggestDebounced };
+export type { Config, FetchResult, ResultMeta, ResultDetail, ParsedResponse, SuggestItem, SuggestResult };
 
 // ---- 型定義 -------------------------------------------------------
 
-export type SearchType = "web" | "image" | "video" | "news" | "suggest" | "panel";
+export type SearchType = "web" | "image" | "video" | "news" | "panel";
+// ※ suggest は SearchType から除外。専用 API (getSuggest) を使う。
 
-/** 大規模・高負荷型コンテンツタイプ */
 const HEAVY_TYPES: ReadonlySet<SearchType> = new Set(["image", "video"]);
 
 export interface SearchOptions {
@@ -31,10 +38,6 @@ export interface SearchOptions {
   enableStreaming?: boolean;
   onChunk?: (chunk: unknown) => void;
   usePersistentCache?: boolean;
-  /**
-   * true のときメタ情担のみを返す。
-   * 詳細は fetchDetail() で遅延取得する。
-   */
   metaOnly?: boolean;
 }
 
@@ -43,10 +46,6 @@ export interface RequestOptions {
   priority?: PriorityValue;
   onChunk?: ((chunk: unknown) => void) | null;
   usePersistentCache?: boolean;
-}
-
-export interface MetaSearchResult extends FetchResult {
-  meta?: ResultMeta[];
 }
 
 // ---- 初期化・破棄 ---------------------------------------------------
@@ -65,6 +64,7 @@ export async function destroy(): Promise<void> {
   clearQueues();
   inFlight.clear();
   clearStore();
+  clearSuggestCache();
   await destroyDB();
   destroyMemoryMonitor();
   if (_cleanupTimer !== null) {
@@ -97,7 +97,6 @@ async function request(
   const cfg = getConfig();
   const lowMem = getIsLowMemory();
 
-  // メモリ圧力に応じたキャッシュ削減
   if (getIsCriticalMemory()) {
     evictExpired();
     trimToHalf();
@@ -119,7 +118,6 @@ async function request(
     const hit = memGet(cacheKey);
     if (hit) {
       if (hit.expired && !lowMem) {
-        // SWR: 期限切れでも即座に返し、バックグラウンドで更新
         enqueue(async () => {
           const r = await fetchWithRetry(url.toString(), _fetchOpts, reqKey);
           if (r.ok) {
@@ -134,7 +132,6 @@ async function request(
     if (usePersistentCache) {
       const pData = await getP(cacheKey);
       if (pData) {
-        // LowMemory 時は永続キャッシュからのみ復元、メモリ展開なし
         if (!lowMem) memSet(cacheKey, pData);
         return { ok: true, data: pData, cached: true, persistent: true };
       }
@@ -186,11 +183,6 @@ function _prefetch(endpoint: string, params: Record<string, unknown>): void {
 
 // ---- パブリック API ─────────────────────────────────────
 
-/**
- * 小・中規模検索―レスポンス全体を取得しキャッシュする。
- * metaOnly = true のときはメタ情報だけ抽出して返す（メモリ節約）。
- * 詳細データは fetchDetail() で遅延取得する。
- */
 export async function search({
   q,
   page = 1,
@@ -204,49 +196,35 @@ export async function search({
 }: SearchOptions): Promise<FetchResult> {
   if (!q?.trim()) return { ok: false, error: "empty_query" };
 
-  const lowMem = getIsLowMemory();
+  const lowMem  = getIsLowMemory();
   const isHeavy = HEAVY_TYPES.has(type);
-  // 大規模コンテンツ or 高負荷状態は強制ストリーミング
   const forceStream = isHeavy && lowMem;
 
   const params = { q: q.trim(), page, type, safesearch, lang };
 
-  // LowMemory 時はプリフェッチ停止
-  if (type !== "suggest" && page < 10 && !lowMem) {
+  if (page < 10 && !lowMem) {
     _prefetch("/search", { ...params, page: page + 1 });
   }
 
-  // ---- ストリーミングモード（大規模 or 高負荷） ----
-  if (forceStream || (enableStreaming && !lowMem && onChunk)) {
-    const metaBuf: ResultMeta[] = [];
-    const streamChunk = (chunk: unknown): void => {
-      const m = chunkToMeta(chunk);
-      if (m) metaBuf.push(m);
-      onChunk?.(chunk);          // 元の onChunk も呼ぶ
-    };
-
-    const result = await request("/search", params, {
+  if (forceStream || (enableStreaming && onChunk)) {
+    return request("/search", params, {
       priority: Priority.NORMAL,
-      onChunk: streamChunk,
+      onChunk: onChunk ?? undefined,
       usePersistentCache,
     });
-
-    // ストリーミング中はメモリキャッシュに書き込まない（すでに retry.ts 内でブロック済み）
-    return result;
   }
 
-  // ---- 通常モード ----
   const result = await request("/search", params, {
-    priority: type === "suggest" ? Priority.HIGH : Priority.NORMAL,
+    priority: Priority.NORMAL,
     onChunk: null,
     usePersistentCache,
   });
 
   if (!result.ok) return result;
 
-  // metaOnly: 必要最小限のフィールドだけ抽出して返す
-  if (metaOnly) {
-    const meta = extractMeta(result.data);
+  const shouldExtractMeta = isHeavy || metaOnly || lowMem;
+  if (shouldExtractMeta) {
+    const meta = extractMeta(result.data, type, lowMem);
     return { ...result, data: meta };
   }
 
@@ -254,13 +232,7 @@ export async function search({
 }
 
 /**
- * メタ情報のみを先に取得するショートハンド。
- * リスト画面の高速描画に使う。
- *
- * @example
- * const { data: meta } = await searchMeta({ q: "cats", type: "image" });
- * // ユーザーがクリックしたときに詳細を取得
- * const detail = await fetchDetail({ q: "cats", type: "image" }, 3);
+ * メタ情報のみを先に取得。
  */
 export function searchMeta(
   opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">
@@ -269,11 +241,7 @@ export function searchMeta(
 }
 
 /**
- * キャッシュ済みレスポンスから指定インデックスの詳細データを取得する。
- * ネットワークリクエストは発生しない（キャッシュ済みデータのみ使用）。
- *
- * @param opts 元の検索オプション（キャッシュキーの特定に使う）
- * @param idx  results 配列のインデックス
+ * キャッシュから詳細データを取得する。
  */
 export async function fetchDetail(
   opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">,
@@ -282,26 +250,30 @@ export async function fetchDetail(
   const { q, page = 1, type = "web", safesearch = 0, lang = "ja", usePersistentCache = false } = opts;
   if (!q?.trim()) return null;
 
-  const params = { q: q.trim(), page, type, safesearch, lang };
+  const params   = { q: q.trim(), page, type, safesearch, lang };
   const cacheKey = getCacheKey("/search", params);
 
-  // まずメモリキャッシュから
   const hit = memGet(cacheKey);
   if (hit) return extractDetail(hit.data, idx);
 
-  // 永続キャッシュから
   if (usePersistentCache) {
     const pData = await getP(cacheKey);
     if (pData) return extractDetail(pData, idx);
   }
 
-  // キャッシュなし→フル取得
   const result = await request("/search", params, {
     priority: Priority.NORMAL,
     usePersistentCache,
   });
-  if (!result.ok) return null;
-  return extractDetail(result.data, idx);
+  return result.ok ? extractDetail(result.data, idx) : null;
+}
+
+/**
+ * サジェスト取得（即座式）。
+ * 入力イベントで連打ちされる場合は getSuggestDebounced を使う。
+ */
+export function getSuggest(q: string): Promise<SuggestResult> {
+  return _getSuggest(q);
 }
 
 // ---- タイプ別ショートハンド -------------------------------------------
@@ -310,5 +282,4 @@ export const searchWeb   = (q: string, page = 1): Promise<FetchResult> => search
 export const searchImage = (q: string, page = 1): Promise<FetchResult> => search({ q, page, type: "image" });
 export const searchVideo = (q: string, page = 1): Promise<FetchResult> => search({ q, page, type: "video" });
 export const searchNews  = (q: string, page = 1): Promise<FetchResult> => search({ q, page, type: "news" });
-export const getSuggest  = (q: string): Promise<FetchResult>           => search({ q, type: "suggest" });
 export const searchPanel = (q: string): Promise<FetchResult>           => search({ q, type: "panel" });

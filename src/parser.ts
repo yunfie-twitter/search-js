@@ -1,80 +1,100 @@
 // src/parser.ts
-// 部分パース・メタ先行取得・フィールド抜き出し
+// タイプ別部分パース・メタ先行取得・フィールド抜き出し
+
+import type { SearchType } from "./index.ts";
 
 // ---- 型定義 --------------------------------------------------------
 
-export interface ResultMeta {
+/** 全タイプ共通のベースメタ */
+export interface BaseMeta {
+  _idx: number;
   title?: string;
   url?: string;
-  thumbnail?: string;
-  /** 元のインデックス（detail 取得用） */
-  _idx: number;
 }
 
-export interface ResultDetail extends ResultMeta {
-  description?: string;
-  date?: string;
-  [key: string]: unknown;
+/** Web 検索メタ */
+export interface WebMeta extends BaseMeta {
+  summary?: string;
+  favicon?: string;
 }
+
+/** 画像検索メタ */
+export interface ImageMeta extends BaseMeta {
+  thumbnail?: string;
+  domain?: string;
+}
+
+/** 動画検索メタ */
+export interface VideoMeta extends BaseMeta {
+  thumbnail?: string;
+  duration?: string;
+  publishedDate?: string;
+}
+
+/** ニュース検索メタ */
+export interface NewsMeta extends BaseMeta {
+  summary?: string;
+  favicon?: string;
+  publishedDate?: string;
+}
+
+/** タイプ別メタの union */
+export type ResultMeta = WebMeta | ImageMeta | VideoMeta | NewsMeta | BaseMeta;
+
+/** 各タイプの詳細型（メタ + 全フィールド） */
+export type ResultDetail = ResultMeta & { [key: string]: unknown };
 
 export interface ParsedResponse {
   meta: ResultMeta[];
   raw: unknown;
 }
 
-// 小・中規模で部分パースするフィールドセット
-export const META_FIELDS: ReadonlySet<string> = new Set([
-  "title", "url", "href", "link",
-  "thumbnail", "image", "img", "thumb",
-]);
-
-// ---- ユーティリティ --------------------------------------------------------
+// ---- タイプ別メタフィールド定義 -----------------------------------------
 
 /**
- * 任意オブジェクトから指定フィールドのみを抽出する。
- * 部分パースで必要最小限のメモリしか使わない。
+ * タイプ別に取得するメタフィールド。
+ * LowMemory 時に summary などの重いフィールドを省略する判断にも使う。
  */
-export function pickFields<T extends Record<string, unknown>>(
-  obj: T,
-  fields: ReadonlySet<string>
-): Partial<T> {
-  const out: Partial<T> = {};
-  for (const key of fields) {
-    if (key in obj) (out as Record<string, unknown>)[key] = obj[key];
-  }
-  return out;
-}
+const META_FIELDS_BY_TYPE: Record<string, ReadonlyArray<string>> = {
+  web:   ["title", "url", "summary", "favicon"],
+  news:  ["title", "url", "summary", "favicon", "publishedDate"],
+  image: ["title", "url", "thumbnail", "domain"],
+  video: ["title", "url", "thumbnail", "duration", "publishedDate"],
+  // suggest / panel はフルデータのまま使う
+};
+
+/** LowMemory 時に省略する重いフィールド */
+const HEAVY_FIELDS: ReadonlySet<string> = new Set(["summary"]);
+
+// ---- パブリック API -------------------------------------------------------
 
 /**
- * レスポンスデータから ResultMeta[] を抽出する。
- * API レスポンスのトップレベルに配列があればそれを使い、
- * なければ data.results / data.items などを探索する。
+ * レスポンスデータからタイプ別の ResultMeta[] を抽出する。
+ *
+ * @param data      API レスポンスデータ
+ * @param type      検索タイプ
+ * @param lowMemory true のときは HEAVY_FIELDS を省略してメモリ節約
  */
-export function extractMeta(data: unknown): ResultMeta[] {
-  const arr = _toArray(data);
-  return arr.map((item, idx) => {
+export function extractMeta(
+  data: unknown,
+  type: SearchType = "web",
+  lowMemory = false
+): ResultMeta[] {
+  const fields = _fieldsForType(type, lowMemory);
+  return _toArray(data).map((item, idx) => {
     const obj = item as Record<string, unknown>;
-    const meta: ResultMeta = { _idx: idx };
-
-    // title
-    meta.title = _str(obj.title ?? obj.name);
-    // url
-    meta.url   = _str(obj.url ?? obj.href ?? obj.link);
-    // thumbnail
-    meta.thumbnail = _str(obj.thumbnail ?? obj.image ?? obj.img ?? obj.thumb);
-
-    // undefined のフィールドを消す
-    if (!meta.title)     delete meta.title;
-    if (!meta.url)       delete meta.url;
-    if (!meta.thumbnail) delete meta.thumbnail;
-
-    return meta;
+    const meta: Record<string, unknown> = { _idx: idx };
+    for (const f of fields) {
+      const v = _resolve(obj, f);
+      if (v !== undefined) meta[f] = v;
+    }
+    return meta as ResultMeta;
   });
 }
 
 /**
- * 指定 index のアイテムから ResultDetail を抽出する。
- * ユーザー操作時に呼び、詳細データを遅延取得するために使う。
+ * 指定 index のアイテムから全フィールドの ResultDetail を抽出する。
+ * fetchDetail() から呼ばれる。
  */
 export function extractDetail(data: unknown, idx: number): ResultDetail | null {
   const arr = _toArray(data);
@@ -83,38 +103,85 @@ export function extractDetail(data: unknown, idx: number): ResultDetail | null {
   const obj = item as Record<string, unknown>;
   return {
     _idx: idx,
-    title:       _str(obj.title ?? obj.name),
-    url:         _str(obj.url ?? obj.href ?? obj.link),
-    thumbnail:   _str(obj.thumbnail ?? obj.image ?? obj.img ?? obj.thumb),
-    description: _str(obj.description ?? obj.snippet ?? obj.desc ?? obj.content),
-    date:        _str(obj.date ?? obj.published ?? obj.publishedAt),
+    title:         _str(obj.title ?? obj.name),
+    url:           _str(obj.url ?? obj.href ?? obj.link),
+    thumbnail:     _str(obj.thumbnail ?? obj.image ?? obj.img ?? obj.thumb),
+    favicon:       _str(obj.favicon ?? obj.icon),
+    domain:        _str(obj.domain ?? obj.source),
+    summary:       _str(obj.summary ?? obj.description ?? obj.snippet ?? obj.desc ?? obj.content),
+    duration:      _str(obj.duration),
+    publishedDate: _str(obj.publishedDate ?? obj.date ?? obj.published ?? obj.publishedAt),
     ...obj,
   };
 }
 
 /**
  * ストリーミングチャンクから ResultMeta を逐次抽出する。
- * onChunk に渡して画面を順次描画するときに使う。
+ * onChunk コールバック内で画面を順次描画するときに使う。
  */
-export function chunkToMeta(chunk: unknown): ResultMeta | null {
+export function chunkToMeta(
+  chunk: unknown,
+  type: SearchType = "web",
+  lowMemory = false
+): ResultMeta | null {
   if (!chunk || typeof chunk !== "object") return null;
   const obj = chunk as Record<string, unknown>;
-  // チャンク自体がアイテムの場合
+
   if ("title" in obj || "url" in obj) {
-    return {
+    const fields = _fieldsForType(type, lowMemory);
+    const meta: Record<string, unknown> = {
       _idx: typeof obj._idx === "number" ? obj._idx : 0,
-      title:     _str(obj.title ?? obj.name),
-      url:       _str(obj.url ?? obj.href),
-      thumbnail: _str(obj.thumbnail ?? obj.image),
     };
+    for (const f of fields) {
+      const v = _resolve(obj, f);
+      if (v !== undefined) meta[f] = v;
+    }
+    return meta as ResultMeta;
   }
-  // チャンクが { results: [...] } などのラッパーの場合
+
+  // { results: [...] } などラッパーがあれば先頭要素を処理
   const arr = _toArray(obj);
-  if (arr.length > 0) return chunkToMeta(arr[0]);
+  if (arr.length > 0) return chunkToMeta(arr[0], type, lowMemory);
   return null;
 }
 
 // ---- 内部ユーティリティ ---------------------------------------------------
+
+/** タイプとメモリ状態に応じたフィールド一覧を返す */
+function _fieldsForType(
+  type: SearchType,
+  lowMemory: boolean
+): ReadonlyArray<string> {
+  const base = META_FIELDS_BY_TYPE[type] ?? ["title", "url"];
+  if (!lowMemory) return base;
+  return base.filter((f) => !HEAVY_FIELDS.has(f));
+}
+
+/**
+ * フィールド名に対するエイリアスを考慮して値を解決する。
+ * 主要フィールド名も API によって異なるため、代替名も探索する。
+ */
+const FIELD_ALIASES: Record<string, ReadonlyArray<string>> = {
+  url:           ["url", "href", "link"],
+  thumbnail:     ["thumbnail", "image", "img", "thumb"],
+  favicon:       ["favicon", "icon"],
+  domain:        ["domain", "source", "siteName"],
+  summary:       ["summary", "description", "snippet", "desc", "content"],
+  publishedDate: ["publishedDate", "date", "published", "publishedAt"],
+  duration:      ["duration", "length"],
+};
+
+function _resolve(obj: Record<string, unknown>, field: string): string | undefined {
+  const aliases = FIELD_ALIASES[field];
+  if (aliases) {
+    for (const a of aliases) {
+      const v = _str(obj[a]);
+      if (v !== undefined) return v;
+    }
+    return undefined;
+  }
+  return _str(obj[field]);
+}
 
 function _str(v: unknown): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
@@ -124,7 +191,6 @@ function _toArray(data: unknown): unknown[] {
   if (Array.isArray(data)) return data;
   if (data && typeof data === "object") {
     const obj = data as Record<string, unknown>;
-    // 一般的なフィールド名を探索
     for (const key of ["results", "items", "data", "hits", "entries", "docs"]) {
       if (Array.isArray(obj[key])) return obj[key] as unknown[];
     }
