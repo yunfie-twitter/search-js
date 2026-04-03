@@ -12,6 +12,7 @@ export interface FetchResult {
   streamed?: boolean;
 }
 
+// 進行中リクエストの AbortController マップ
 const controllers = new Map<string, AbortController>();
 
 export function cancel(key: string): void {
@@ -35,15 +36,39 @@ export async function fetchWithRetry(
   const canStream = typeof ReadableStream !== "undefined" && !!onChunk;
 
   for (let attempt = 0; attempt <= cfg.RETRIES; attempt++) {
-    const ctrl = canAbort ? new AbortController() : null;
-    // 同一キーの前回リクエストをキャンセルして重複を防ぐ
+    // 同一キーの前回分を必ずキャンセルしてリーク防止
     controllers.get(key)?.abort();
+    const ctrl = canAbort ? new AbortController() : null;
     if (ctrl) controllers.set(key, ctrl);
 
-    const tid = setTimeout(() => ctrl?.abort(), cfg.TIMEOUT);
+    // 外部 signal と内部 ctrl のマージ
+    const externalSignal = opts.signal;
+    let mergedSignal: AbortSignal | undefined;
+    if (ctrl && externalSignal) {
+      // 両方のキャンセルを捕捉
+      if (typeof AbortSignal.any === "function") {
+        mergedSignal = AbortSignal.any([ctrl.signal, externalSignal]);
+      } else {
+        // フォールバック: 外部 signal を監視して ctrl に伝總
+        const bridge = (): void => ctrl.abort();
+        externalSignal.addEventListener("abort", bridge, { once: true });
+        mergedSignal = ctrl.signal;
+      }
+    } else {
+      mergedSignal = ctrl?.signal ?? externalSignal;
+    }
+
+    const fetchOpts: RequestInit = mergedSignal
+      ? { ...opts, signal: mergedSignal }
+      : opts;
+
+    // タイムアウトは ctrl ベースのシグナルのみ abort
+    const tid = ctrl
+      ? setTimeout(() => ctrl.abort(), cfg.TIMEOUT)
+      : undefined;
 
     try {
-      const res = await fetch(url, ctrl ? { ...opts, signal: ctrl.signal } : opts);
+      const res = await fetch(url, fetchOpts);
       clearTimeout(tid);
       controllers.delete(key);
 
@@ -86,8 +111,13 @@ const _sleep = (ms: number): Promise<void> =>
   new Promise<void>((r) => setTimeout(r, ms));
 
 /**
- * ストリームを読み取り、JSON オブジェクトを逐次コールバックに渡す。
- * finally ブロックで必ずリーダーロックと参照を解放してメモリリークを防ぐ。
+ * ストリームを読み取って JSON オブジェクトを逆次コールバックに渡す。
+ *
+ * リーク防止のための保証:
+ * - finally で必ず reader.releaseLock()
+ * - { once: true } で abort リスナーを自動解除
+ * - finally で buf を空文字列にして文字列参照を切る
+ * - aborted 時は reader.cancel() でストリームを閉じる
  */
 async function _readStream(
   body: ReadableStream<Uint8Array>,
@@ -104,27 +134,37 @@ async function _readStream(
   let aborted = false;
   const chunks: unknown[] = [];
 
-  // { once: true } でリスナー自身がメモリに残らないようにする
-  const onAbort = (): void => { aborted = true; void reader.cancel(); };
+  const onAbort = (): void => {
+    aborted = true;
+    // cancel() は非同期なので void で捨てる
+    reader.cancel().catch(() => {});
+  };
   ctrl?.signal.addEventListener("abort", onAbort, { once: true });
 
   try {
-    while (!aborted) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
+    outer: while (!aborted) {
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch {
+        // キャンセル・ネットワークエラーはループを抖り出す
+        break outer;
+      }
+      if (readResult.done) break;
+      buf += dec.decode(readResult.value, { stream: true });
       if (buf.length > cfg.STREAMING_BUFFER_SIZE) _flush();
     }
     if (!aborted) _flush();
   } finally {
-    // ストリーム完了後は必ずロックと参照を解放
-    reader.releaseLock();
     ctrl?.signal.removeEventListener("abort", onAbort);
-    buf = ""; // バッファを明示的に解放
+    // releaseLock は cancel 後でも安全に呼び出せる
+    try { reader.releaseLock(); } catch { /* 既に解放済みの場合 */ }
+    buf = "";
   }
 
   return {
-    ok: true,
+    ok: !aborted,
+    ...(aborted ? { error: "cancelled" } : {}),
     data: chunks.length === 1 ? chunks[0] : chunks,
     streamed: true,
   };
@@ -133,11 +173,11 @@ async function _readStream(
     let start = 0;
     for (let i = 0; i < buf.length; i++) {
       const c = buf[i];
-      if (esc) { esc = false; continue; }
-      if (c === "\\") { esc = true; continue; }
-      if (c === '"') { inStr = !inStr; continue; }
-      if (inStr) continue;
-      if (c === "{") { if (!braces) start = i; braces++; }
+      if (esc)         { esc = false; continue; }
+      if (c === "\\")  { esc = true;  continue; }
+      if (c === '"')   { inStr = !inStr; continue; }
+      if (inStr)       continue;
+      if (c === "{")   { if (!braces) start = i; braces++; }
       else if (c === "}") {
         if (!--braces) {
           try {
