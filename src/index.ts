@@ -11,15 +11,22 @@ import {
   extractMeta, extractDetail, chunkToMeta,
   type ResultMeta, type ResultDetail, type ParsedResponse,
 } from "./parser.ts";
+import {
+  getSuggest as _getSuggest,
+  getSuggestDebounced,
+  clearSuggestCache,
+  type SuggestItem,
+  type SuggestResult,
+} from "./suggest.ts";
 
-export { configure, debounce, cancelRequest, cancelAll };
-export type { Config, FetchResult, ResultMeta, ResultDetail, ParsedResponse };
+export { configure, debounce, cancelRequest, cancelAll, getSuggestDebounced };
+export type { Config, FetchResult, ResultMeta, ResultDetail, ParsedResponse, SuggestItem, SuggestResult };
 
 // ---- 型定義 -------------------------------------------------------
 
-export type SearchType = "web" | "image" | "video" | "news" | "suggest" | "panel";
+export type SearchType = "web" | "image" | "video" | "news" | "panel";
+// ※ suggest は SearchType から除外。専用 API (getSuggest) を使う。
 
-/** 大規模・高負荷型コンテンツ（ストリーミング優先） */
 const HEAVY_TYPES: ReadonlySet<SearchType> = new Set(["image", "video"]);
 
 export interface SearchOptions {
@@ -31,10 +38,6 @@ export interface SearchOptions {
   enableStreaming?: boolean;
   onChunk?: (chunk: unknown) => void;
   usePersistentCache?: boolean;
-  /**
-   * true のときメタ情報のみを返す。
-   * summary などの重いフィールドは含まない、0.数秒でリスト描画できる。
-   */
   metaOnly?: boolean;
 }
 
@@ -61,6 +64,7 @@ export async function destroy(): Promise<void> {
   clearQueues();
   inFlight.clear();
   clearStore();
+  clearSuggestCache();
   await destroyDB();
   destroyMemoryMonitor();
   if (_cleanupTimer !== null) {
@@ -179,14 +183,6 @@ function _prefetch(endpoint: string, params: Record<string, unknown>): void {
 
 // ---- パブリック API ─────────────────────────────────────
 
-/**
- * 検索のメイン API。
- *
- * タイプ別の取得戦略:
- * - web / news : フル取得 → メモリキャッシュ。metaOnly 時は summary を除いたメタのみ返す。
- * - image/video : 大規模なのでメタのみ返す。詳細は fetchDetail() で取得。
- * - LowMemory   : HEAVY タイプはストリーミング強制、summary を筆頭に除外。
- */
 export async function search({
   q,
   page = 1,
@@ -200,39 +196,32 @@ export async function search({
 }: SearchOptions): Promise<FetchResult> {
   if (!q?.trim()) return { ok: false, error: "empty_query" };
 
-  const lowMem    = getIsLowMemory();
-  const isHeavy   = HEAVY_TYPES.has(type);
+  const lowMem  = getIsLowMemory();
+  const isHeavy = HEAVY_TYPES.has(type);
   const forceStream = isHeavy && lowMem;
 
   const params = { q: q.trim(), page, type, safesearch, lang };
 
-  if (type !== "suggest" && page < 10 && !lowMem) {
+  if (page < 10 && !lowMem) {
     _prefetch("/search", { ...params, page: page + 1 });
   }
 
-  // ---- ストリーミングモード (大規模 or 高負荷時に強制適用) ----
   if (forceStream || (enableStreaming && onChunk)) {
-    const streamChunk = (chunk: unknown): void => {
-      onChunk?.(chunk);
-    };
     return request("/search", params, {
       priority: Priority.NORMAL,
-      onChunk: streamChunk,
+      onChunk: onChunk ?? undefined,
       usePersistentCache,
     });
   }
 
-  // ---- 通常モード ----
   const result = await request("/search", params, {
-    priority: type === "suggest" ? Priority.HIGH : Priority.NORMAL,
+    priority: Priority.NORMAL,
     onChunk: null,
     usePersistentCache,
   });
 
   if (!result.ok) return result;
 
-  // 画像・動画は常に metaOnly（詳細は fetchDetail()）
-  // web / news は metaOnly フラグ or LowMemory（summary を除外）のときのみ
   const shouldExtractMeta = isHeavy || metaOnly || lowMem;
   if (shouldExtractMeta) {
     const meta = extractMeta(result.data, type, lowMem);
@@ -243,17 +232,7 @@ export async function search({
 }
 
 /**
- * メタ情報のみを先に取得するショートハンド。
- * リスト画面の高速初回描画に使う。
- *
- * @example
- * // Web: title, url, summary, favicon
- * const { data } = await searchMeta({ q: "TypeScript" });
- *
- * // Image: title, url, thumbnail, domain
- * const { data } = await searchMeta({ q: "cats", type: "image" });
- *
- * // LowMemory 時は summary を自動省略
+ * メタ情報のみを先に取得。
  */
 export function searchMeta(
   opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">
@@ -262,13 +241,7 @@ export function searchMeta(
 }
 
 /**
- * キャッシュ済みデータから指定インデックスの詳細データを取得する。
- * 基本的にネットワークリクエストは発生しない（キャッシュがあれば）。
- *
- * @example
- * // ユーザーが結果をクリックしたとき
- * const detail = await fetchDetail({ q: "TypeScript", type: "web" }, 2);
- * // detail.summary, detail.favicon など全フィールドあり
+ * キャッシュから詳細データを取得する。
  */
 export async function fetchDetail(
   opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">,
@@ -277,25 +250,30 @@ export async function fetchDetail(
   const { q, page = 1, type = "web", safesearch = 0, lang = "ja", usePersistentCache = false } = opts;
   if (!q?.trim()) return null;
 
-  const params  = { q: q.trim(), page, type, safesearch, lang };
+  const params   = { q: q.trim(), page, type, safesearch, lang };
   const cacheKey = getCacheKey("/search", params);
 
-  // 1. メモリキャッシュから
   const hit = memGet(cacheKey);
   if (hit) return extractDetail(hit.data, idx);
 
-  // 2. 永続キャッシュから
   if (usePersistentCache) {
     const pData = await getP(cacheKey);
     if (pData) return extractDetail(pData, idx);
   }
 
-  // 3. キャッシュなし → フル取得（不少ないケース）
   const result = await request("/search", params, {
     priority: Priority.NORMAL,
     usePersistentCache,
   });
   return result.ok ? extractDetail(result.data, idx) : null;
+}
+
+/**
+ * サジェスト取得（即座式）。
+ * 入力イベントで連打ちされる場合は getSuggestDebounced を使う。
+ */
+export function getSuggest(q: string): Promise<SuggestResult> {
+  return _getSuggest(q);
 }
 
 // ---- タイプ別ショートハンド -------------------------------------------
@@ -304,5 +282,4 @@ export const searchWeb   = (q: string, page = 1): Promise<FetchResult> => search
 export const searchImage = (q: string, page = 1): Promise<FetchResult> => search({ q, page, type: "image" });
 export const searchVideo = (q: string, page = 1): Promise<FetchResult> => search({ q, page, type: "video" });
 export const searchNews  = (q: string, page = 1): Promise<FetchResult> => search({ q, page, type: "news" });
-export const getSuggest  = (q: string): Promise<FetchResult>           => search({ q, type: "suggest" });
 export const searchPanel = (q: string): Promise<FetchResult>           => search({ q, type: "panel" });
