@@ -1,5 +1,6 @@
 // src/memory.ts
 import { getConfig } from "./config.ts";
+import { emit } from "./events.ts";
 
 interface Capabilities {
   performanceMemory: boolean;
@@ -24,10 +25,6 @@ export const getIsLowMemory = (): boolean => isLowMemory;
 export const getIsCriticalMemory = (): boolean => isCriticalMemory;
 export const getCurrentCacheMax = (): number => currentCacheMax;
 
-/**
- * メモリモニターを初期化。
- * 複数回呼ばれてもタイマーは常に1つだけ保持する。
- */
 export function initMemoryMonitor(cacheRef: Map<unknown, unknown>): void {
   if (_monitorTimer !== null) {
     clearInterval(_monitorTimer);
@@ -45,7 +42,6 @@ export function initMemoryMonitor(cacheRef: Map<unknown, unknown>): void {
   _monitorTimer = setInterval(() => _check(cacheRef), cfg.MEMORY_CHECK_INTERVAL);
 }
 
-/** モニターを停止（SSR・テスト・ページ離脱時に呼ぶ） */
 export function destroyMemoryMonitor(): void {
   if (_monitorTimer !== null) {
     clearInterval(_monitorTimer);
@@ -59,7 +55,6 @@ function _check(cacheRef: Map<unknown, unknown>): void {
   const cfg = getConfig();
   let pressure = 0;
 
-  // --- ヒープ使用率 ---
   if (capabilities.performanceMemory) {
     const mem = (performance as Performance & {
       memory: { usedJSHeapSize: number; jsHeapSizeLimit: number };
@@ -67,30 +62,33 @@ function _check(cacheRef: Map<unknown, unknown>): void {
     pressure = Math.max(pressure, (mem.usedJSHeapSize / mem.jsHeapSizeLimit) * 100);
   }
 
-  // --- キャッシュサイズによる擬似圧力 ---
   if (cacheRef.size > currentCacheMax * 0.85) {
     pressure = Math.max(pressure, 65);
   }
 
-  const wasLow = isLowMemory;
-  const normalThreshold = cfg.MEMORY_PRESSURE_NORMAL * 100;
+  const prevLow      = isLowMemory;
+  const prevCritical = isCriticalMemory;
+
+  const normalThreshold   = cfg.MEMORY_PRESSURE_NORMAL * 100;
   const criticalThreshold = cfg.MEMORY_PRESSURE_CRITICAL * 100;
 
   isCriticalMemory = pressure > criticalThreshold;
-  isLowMemory = pressure > normalThreshold;
+  isLowMemory      = pressure > normalThreshold;
+
+  // 状態変化時にイベント発火
+  if (isLowMemory !== prevLow || isCriticalMemory !== prevCritical) {
+    emit("memoryStateChange", { isLow: isLowMemory, isCritical: isCriticalMemory });
+  }
 
   if (isLowMemory) {
-    // --- LowMemory: キャッシュを積極削減 ---
     const target = isCriticalMemory
       ? Math.ceil(cfg.CACHE_LOW_MEMORY * 0.5)
       : cfg.CACHE_LOW_MEMORY;
-
     if (currentCacheMax > target) {
       _trimCache(cacheRef, target);
       currentCacheMax = target;
     }
-  } else if (!isLowMemory && wasLow) {
-    // --- 回復: 上限を段階的に戻す ---
+  } else if (!isLowMemory && prevLow) {
     currentCacheMax = Math.min(cfg.CACHE_MAX, Math.ceil(currentCacheMax * 1.5));
   }
 }
