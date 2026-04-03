@@ -1,205 +1,101 @@
 // src/memory.ts
-import { getConfig } from "./config.ts";
-import { emit } from "./events.ts";
-
-/**
- * =======================
- * 型定義
- * =======================
- */
+import { getConfig } from "./config.js";
+import { emit } from "./events.js";
 
 interface Capabilities {
   performanceMemory: boolean;
   deviceMemory: boolean;
 }
 
-interface MemoryState {
-  isLow: boolean;
-  isCritical: boolean;
-  cacheMax: number;
-}
-
-/**
- * =======================
- * 定数
- * =======================
- */
-
-const CACHE_PRESSURE_RATIO = 0.85;
-const CACHE_PRESSURE_SCORE = 65;
-
-/**
- * =======================
- * 環境検出
- * =======================
- */
-
 const capabilities: Capabilities = {
   performanceMemory:
     typeof performance !== "undefined" &&
-    "memory" in performance,
-
+    !!(performance as Performance & { memory?: unknown }).memory,
   deviceMemory:
     typeof navigator !== "undefined" &&
-    "deviceMemory" in navigator,
+    typeof (navigator as Navigator & { deviceMemory?: number }).deviceMemory === "number",
 };
 
-/**
- * =======================
- * 内部状態
- * =======================
- */
+let isLowMemory = false;
+let isCriticalMemory = false;
+let currentCacheMax = 0;
+let _monitorTimer: ReturnType<typeof setInterval> | null = null;
 
-let state: MemoryState = {
-  isLow: false,
-  isCritical: false,
-  cacheMax: 0,
-};
+export const getIsLowMemory = (): boolean => isLowMemory;
+export const getIsCriticalMemory = (): boolean => isCriticalMemory;
+export const getCurrentCacheMax = (): number => currentCacheMax;
 
-let timer: ReturnType<typeof setInterval> | null = null;
-let config = getConfig();
+export function initMemoryMonitor(cacheRef: Map<unknown, unknown>): void {
+  if (_monitorTimer !== null) {
+    clearInterval(_monitorTimer);
+    _monitorTimer = null;
+  }
 
-/**
- * =======================
- * Public API
- * =======================
- */
+  const cfg = getConfig();
+  currentCacheMax = cfg.CACHE_MAX;
 
-export const getIsLowMemory = () => state.isLow;
-export const getIsCriticalMemory = () => state.isCritical;
-export const getCurrentCacheMax = () => state.cacheMax;
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  if (capabilities.deviceMemory && nav.deviceMemory !== undefined && nav.deviceMemory <= 2) {
+    currentCacheMax = cfg.CACHE_LOW_MEMORY;
+  }
 
-export function initMemoryMonitor(cache: Map<unknown, unknown>): void {
-  stopMonitor();
-
-  config = getConfig();
-  state.cacheMax = resolveInitialCacheSize(config);
-
-  timer = setInterval(() => {
-    updateState(cache);
-  }, config.MEMORY_CHECK_INTERVAL);
+  _monitorTimer = setInterval(() => _check(cacheRef), cfg.MEMORY_CHECK_INTERVAL);
 }
 
 export function destroyMemoryMonitor(): void {
-  stopMonitor();
-  state = { isLow: false, isCritical: false, cacheMax: 0 };
-}
-
-/**
- * =======================
- * 内部処理
- * =======================
- */
-
-function stopMonitor(): void {
-  if (timer !== null) {
-    clearInterval(timer);
-    timer = null;
+  if (_monitorTimer !== null) {
+    clearInterval(_monitorTimer);
+    _monitorTimer = null;
   }
+  isLowMemory = false;
+  isCriticalMemory = false;
 }
 
-function resolveInitialCacheSize(cfg: ReturnType<typeof getConfig>): number {
-  if (capabilities.deviceMemory) {
-    const nav = navigator as Navigator & { deviceMemory?: number };
-    if (nav.deviceMemory && nav.deviceMemory <= 2) {
-      return cfg.CACHE_LOW_MEMORY;
-    }
-  }
-  return cfg.CACHE_MAX;
-}
-
-/**
- * メイン更新処理
- */
-function updateState(cache: Map<unknown, unknown>): void {
-  const pressure = calculatePressure(cache);
-  const next = evaluateState(pressure);
-
-  handleStateChange(next);
-
-  state.isLow = next.isLow;
-  state.isCritical = next.isCritical;
-
-  adjustCache(cache);
-}
-
-/**
- * 純粋関数：圧力計算
- */
-function calculatePressure(cache: Map<unknown, unknown>): number {
+function _check(cacheRef: Map<unknown, unknown>): void {
+  const cfg = getConfig();
   let pressure = 0;
 
   if (capabilities.performanceMemory) {
     const mem = (performance as Performance & {
-      memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number };
+      memory: { usedJSHeapSize: number; jsHeapSizeLimit: number };
     }).memory;
+    pressure = Math.max(pressure, (mem.usedJSHeapSize / mem.jsHeapSizeLimit) * 100);
+  }
 
-    if (mem) {
-      pressure = Math.max(
-        pressure,
-        (mem.usedJSHeapSize / mem.jsHeapSizeLimit) * 100
-      );
+  if (cacheRef.size > currentCacheMax * 0.85) {
+    pressure = Math.max(pressure, 65);
+  }
+
+  const prevLow      = isLowMemory;
+  const prevCritical = isCriticalMemory;
+
+  const normalThreshold   = cfg.MEMORY_PRESSURE_NORMAL * 100;
+  const criticalThreshold = cfg.MEMORY_PRESSURE_CRITICAL * 100;
+
+  isCriticalMemory = pressure > criticalThreshold;
+  isLowMemory      = pressure > normalThreshold;
+
+  if (isLowMemory !== prevLow || isCriticalMemory !== prevCritical) {
+    emit("memoryStateChange", { isLow: isLowMemory, isCritical: isCriticalMemory });
+  }
+
+  if (isLowMemory) {
+    const target = isCriticalMemory
+      ? Math.ceil(cfg.CACHE_LOW_MEMORY * 0.5)
+      : cfg.CACHE_LOW_MEMORY;
+    if (currentCacheMax > target) {
+      _trimCache(cacheRef, target);
+      currentCacheMax = target;
     }
-  }
-
-  if (cache.size > state.cacheMax * CACHE_PRESSURE_RATIO) {
-    pressure = Math.max(pressure, CACHE_PRESSURE_SCORE);
-  }
-
-  return pressure;
-}
-
-/**
- * 純粋関数：状態判定
- */
-function evaluateState(pressure: number): { isLow: boolean; isCritical: boolean } {
-  return {
-    isLow: pressure > config.MEMORY_PRESSURE_NORMAL * 100,
-    isCritical: pressure > config.MEMORY_PRESSURE_CRITICAL * 100,
-  };
-}
-
-/**
- * 状態変化処理
- */
-function handleStateChange(next: { isLow: boolean; isCritical: boolean }) {
-  if (
-    next.isLow !== state.isLow ||
-    next.isCritical !== state.isCritical
-  ) {
-    emit("memoryStateChange", next);
+  } else if (!isLowMemory && prevLow) {
+    currentCacheMax = Math.min(cfg.CACHE_MAX, Math.ceil(currentCacheMax * 1.5));
   }
 }
 
-/**
- * キャッシュ調整
- */
-function adjustCache(cache: Map<unknown, unknown>): void {
-  if (state.isLow) {
-    const target = state.isCritical
-      ? Math.ceil(config.CACHE_LOW_MEMORY * 0.5)
-      : config.CACHE_LOW_MEMORY;
-
-    if (state.cacheMax > target) {
-      trimCache(cache, target);
-      state.cacheMax = target;
-    }
-  } else {
-    // 回復
-    state.cacheMax = Math.min(
-      config.CACHE_MAX,
-      Math.ceil(state.cacheMax * 1.5)
-    );
-  }
-}
-
-/**
- * FIFO削除（Map依存）
- */
-function trimCache(cache: Map<unknown, unknown>, maxSize: number): void {
-  while (cache.size > maxSize) {
-    const key = cache.keys().next().value;
-    if (key === undefined) break;
-    cache.delete(key);
+function _trimCache(cacheRef: Map<unknown, unknown>, maxSize: number): void {
+  while (cacheRef.size > maxSize) {
+    const firstKey = cacheRef.keys().next().value;
+    if (firstKey !== undefined) cacheRef.delete(firstKey);
+    else break;
   }
 }

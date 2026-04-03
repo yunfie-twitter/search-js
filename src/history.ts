@@ -1,5 +1,4 @@
 // src/history.ts
-// 検索履歴― localStorage に保存してサジェスト候補に混ぜる
 
 const STORAGE_KEY = "__search_js_history__";
 const MAX_HISTORY = 20;
@@ -7,16 +6,12 @@ const MAX_HISTORY = 20;
 export interface HistoryEntry {
   q: string;
   type: string;
-  /** Unix ms */
   time: number;
 }
 
 function _isAvailable(): boolean {
-  try {
-    return typeof localStorage !== "undefined";
-  } catch {
-    return false;
-  }
+  try { return typeof localStorage !== "undefined"; }
+  catch { return false; }
 }
 
 function _load(): HistoryEntry[] {
@@ -24,24 +19,15 @@ function _load(): HistoryEntry[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     return raw ? (JSON.parse(raw) as HistoryEntry[]) : [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 function _save(entries: HistoryEntry[]): void {
   if (!_isAvailable()) return;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
-  } catch {
-    // localStorage 容量超過時は無視
-  }
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(entries)); }
+  catch { /* quota exceeded */ }
 }
 
-/**
- * 検索を履歴に追加する。
- * 同一クエリ(大文字小文字無視)があれば先頭に移動する。
- */
 export function addHistory(q: string, type = "web"): void {
   if (!q.trim()) return;
   const entries = _load().filter(
@@ -51,10 +37,6 @@ export function addHistory(q: string, type = "web"): void {
   _save(entries.slice(0, MAX_HISTORY));
 }
 
-/**
- * 履歴を取得する。
- * @param prefix 指定するとプレフィックスフィルタリングした履歴のみ返す
- */
 export function getHistory(prefix?: string): HistoryEntry[] {
   const entries = _load();
   if (!prefix) return entries;
@@ -62,7 +44,6 @@ export function getHistory(prefix?: string): HistoryEntry[] {
   return entries.filter((e) => e.q.toLowerCase().startsWith(lower));
 }
 
-/** 1件削除 */
 export function removeHistory(q: string, type = "web"): void {
   _save(
     _load().filter(
@@ -71,35 +52,19 @@ export function removeHistory(q: string, type = "web"): void {
   );
 }
 
-/** 履歴を全削除 */
 export function clearHistory(): void {
   if (_isAvailable()) localStorage.removeItem(STORAGE_KEY);
 }
 
-/**
- * サジェスト候補に履歴を混ぜるユーティリティ。
- * 履歴項目を先頭に置き、サジェストと重複する文字列は履歴側を優先する。
- *
- * @example
- * const suggest = await getSuggest(q);
- * const merged = mergeWithHistory(q, suggest.items);
- * renderDropdown(merged);
- */
 export function mergeWithHistory(
   q: string,
   suggestItems: { title: string }[]
 ): { title: string; fromHistory: boolean }[] {
   const histEntries = getHistory(q);
   const histSet = new Set(histEntries.map((e) => e.q.toLowerCase()));
-
-  const histResults = histEntries.map((e) => ({
-    title: e.q,
-    fromHistory: true as const,
-  }));
-
+  const histResults = histEntries.map((e) => ({ title: e.q, fromHistory: true as const }));
   const filtered = suggestItems
     .filter((s) => !histSet.has(s.title.toLowerCase()))
     .map((s) => ({ title: s.title, fromHistory: false as const }));
-
   return [...histResults, ...filtered];
 }

@@ -17,9 +17,7 @@ export interface Config {
   PERSISTENT_CACHE_MAX: number;
   PERSISTENT_CLEANUP_INTERVAL: number;
   MEMORY_CHECK_INTERVAL: number;
-  /** サジェスト用の短い TTL (ms)。デフォルト 30 秒 */
   SUGGEST_TTL: number;
-  /** サジェスト debounce 間隔 (ms)。デフォルト 200 ms */
   SUGGEST_DEBOUNCE_MS: number;
 }
 

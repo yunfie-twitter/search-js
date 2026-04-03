@@ -1,7 +1,8 @@
 // src/utils.ts
-import { getIsLowMemory } from "./memory.ts";
+import { getIsLowMemory } from "./memory.js";
 
-type AnyFunction = (...args: unknown[]) => unknown;
+// AnyFunction は内部型のみ。外部引数は T extends (...args: never[]) => unknown で表現
+type AnyFunction = (...args: never[]) => unknown;
 
 interface DebounceOptions {
   delay?: number;
@@ -12,34 +13,32 @@ interface DebounceOptions {
 
 export function debounce<T extends AnyFunction>(
   fn: T,
-  options: DebounceOptions = {}
+  options: DebounceOptions | number = {}
 ) {
+  const opts: DebounceOptions =
+    typeof options === "number" ? { delay: options } : options;
+
   const {
     delay = 300,
     leading = false,
     trailing = true,
     usePromise = true,
-  } = options;
+  } = opts;
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let lastArgs: Parameters<T> | undefined;
   let pending:
-    | {
-        resolve: (v: ReturnType<T>) => void;
-        reject: (e: unknown) => void;
-      }
+    | { resolve: (v: ReturnType<T>) => void; reject: (e: unknown) => void }
     | undefined;
 
-  const getDelay = () =>
-    getIsLowMemory() ? delay * 2 : delay;
+  const getDelay = (): number => (getIsLowMemory() ? delay * 2 : delay);
 
   const execute = async (): Promise<ReturnType<T>> => {
     if (!lastArgs) return undefined as ReturnType<T>;
-
     try {
-      const result = await fn(...lastArgs);
-      pending?.resolve(result as ReturnType<T>);
-      return result as ReturnType<T>;
+      const result = await (fn as (...a: Parameters<T>) => ReturnType<T>)(...lastArgs);
+      pending?.resolve(result);
+      return result;
     } catch (e) {
       pending?.reject(e);
       throw e;
@@ -48,59 +47,47 @@ export function debounce<T extends AnyFunction>(
     }
   };
 
-  const debounced = (...args: Parameters<T>) => {
+  const debounced = (...args: Parameters<T>): Promise<ReturnType<T>> | void => {
     lastArgs = args;
-
-    // ---- leading ----
     const shouldCallNow = leading && !timer;
-
     if (timer) clearTimeout(timer);
 
     if (shouldCallNow) {
       if (usePromise) {
-        return Promise.resolve(fn(...args) as ReturnType<T>);
-      } else {
-        fn(...args);
-        return;
+        return Promise.resolve(
+          (fn as (...a: Parameters<T>) => ReturnType<T>)(...args)
+        );
       }
+      (fn as (...a: Parameters<T>) => unknown)(...args);
+      return;
     }
 
     if (!trailing) return;
 
-    const d = getDelay();
-
     if (usePromise) {
       return new Promise<ReturnType<T>>((resolve, reject) => {
-        // 古いPromiseをreject（重要）
         pending?.reject(new Error("debounced_cancelled"));
-
         pending = { resolve, reject };
-
         timer = setTimeout(() => {
           timer = undefined;
-          execute();
-        }, d);
+          void execute();
+        }, getDelay());
       });
     }
 
     timer = setTimeout(() => {
       timer = undefined;
-      void fn(...(lastArgs as Parameters<T>));
-    }, d);
+      void (fn as (...a: Parameters<T>) => unknown)(...(lastArgs as Parameters<T>));
+    }, getDelay());
   };
 
-  // ---- cancel ----
-  debounced.cancel = () => {
-    if (timer) {
-      clearTimeout(timer);
-      timer = undefined;
-    }
+  debounced.cancel = (): void => {
+    if (timer) { clearTimeout(timer); timer = undefined; }
     pending?.reject(new Error("debounced_cancelled"));
     pending = undefined;
   };
 
-  // ---- flush（即実行）----
-  debounced.flush = () => {
+  debounced.flush = (): Promise<ReturnType<T>> | undefined => {
     if (!timer) return;
     clearTimeout(timer);
     timer = undefined;
