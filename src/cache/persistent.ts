@@ -2,8 +2,12 @@
 import { getConfig } from "../config.js";
 
 let _dbPromise: Promise<IDBDatabase | null> | null = null;
+// [FREEZE fix] destroyDB 後に進行中の getP/setP が孤立した IDBTransaction を
+// 開こうとするのを防ぐガードフラグ。destroy 後は即 null を返す。
+let _destroyed = false;
 
 function _open(): Promise<IDBDatabase | null> {
+  if (_destroyed) return Promise.resolve(null);
   if (typeof globalThis.indexedDB === "undefined") return Promise.resolve(null);
   if (_dbPromise) return _dbPromise;
 
@@ -22,6 +26,7 @@ function _open(): Promise<IDBDatabase | null> {
   return _dbPromise;
 }
 
+/** IndexedDB から永続キャッシュを取得する。TTL 切れ・未存在は null を返す。 */
 export async function getP(key: string): Promise<unknown> {
   const db = await _open();
   if (!db) return null;
@@ -41,6 +46,7 @@ export async function getP(key: string): Promise<unknown> {
   });
 }
 
+/** IndexedDB に永続キャッシュを書き込む。上限超過時は古いエントリを 20% 削除する。 */
 export async function setP(key: string, data: unknown): Promise<void> {
   const db = await _open();
   if (!db) return;
@@ -64,14 +70,12 @@ export async function setP(key: string, data: unknown): Promise<void> {
           if (c && deleted < maxDel) {
             c.delete(); deleted++; c.continue();
           } else {
-            // [LOW #10 fix] tx.oncomplete を put() より前に設定してから put する
             tx.oncomplete = () => resolve();
             objectStore.put({ data, time: Date.now() }, key);
           }
         };
         cur.onerror = () => reject(cur.error);
       } else {
-        // [LOW #10 fix] tx.oncomplete を put() より前に設定
         tx.oncomplete = () => resolve();
         objectStore.put({ data, time: Date.now() }, key);
       }
@@ -80,6 +84,7 @@ export async function setP(key: string, data: unknown): Promise<void> {
   });
 }
 
+/** TTL 切れエントリを IndexedDB から削除する。 */
 export async function cleanup(): Promise<void> {
   const db = await _open();
   if (!db) return;
@@ -101,8 +106,12 @@ export async function cleanup(): Promise<void> {
   });
 }
 
+/** DB を閉じてリソースを解放する。destroy() から呼ぶこと。 */
 export async function destroyDB(): Promise<void> {
+  _destroyed = true;
   const db = await _open();
   db?.close();
   _dbPromise = null;
+  // 次の init() で再利用できるようフラグをリセット
+  _destroyed = false;
 }

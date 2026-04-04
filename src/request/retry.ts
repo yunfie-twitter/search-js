@@ -14,16 +14,22 @@ export interface FetchResult {
 
 const controllers = new Map<string, AbortController>();
 
+/** 指定キーのリクエストをキャンセルする */
 export function cancel(key: string): void {
   controllers.get(key)?.abort();
   controllers.delete(key);
 }
 
+/** 全進行中リクエストをキャンセルする */
 export function cancelAll(): void {
   for (const ctrl of controllers.values()) ctrl.abort();
   controllers.clear();
 }
 
+/**
+ * リトライ付き fetch。タイムアウト・外部 AbortSignal に対応。
+ * ストリーミングが有効かつ onChunk が渡された場合は _readStream で処理する。
+ */
 export async function fetchWithRetry(
   url: string,
   opts: RequestInit,
@@ -42,7 +48,6 @@ export async function fetchWithRetry(
     const ctrl = canAbort ? new AbortController() : null;
     if (ctrl) controllers.set(key, ctrl);
 
-    // [HIGH #3 fix] bridge を変数に保持して finally で必ず removeEventListener する
     let bridge: (() => void) | undefined;
     let mergedSignal: AbortSignal | undefined;
 
@@ -59,14 +64,12 @@ export async function fetchWithRetry(
     }
 
     const fetchOpts: RequestInit = mergedSignal ? { ...opts, signal: mergedSignal } : opts;
-    // [HIGH #4 fix] tid を attempt スコープ内に閉じ込める
     let tid: ReturnType<typeof setTimeout> | undefined;
     if (ctrl) tid = setTimeout(() => ctrl.abort(), cfg.TIMEOUT);
 
     try {
       const res = await fetch(url, fetchOpts);
       clearTimeout(tid);
-      // bridge が登録されていれば解除
       if (bridge && externalSignal) externalSignal.removeEventListener("abort", bridge);
       controllers.delete(key);
 
@@ -120,7 +123,15 @@ async function _readStream(
   let aborted = false;
   const chunks: unknown[] = [];
 
-  const onAbort = (): void => { aborted = true; reader.cancel().catch(() => {}); };
+  // [FREEZE fix] onAbort は一度だけ実行されることを保証するフラグを追加。
+  // ctrl.signal と finally 内の reader.cancel() が競合しても二重 cancel しない。
+  let abortHandled = false;
+  const onAbort = (): void => {
+    if (abortHandled) return;
+    abortHandled = true;
+    aborted = true;
+    reader.cancel().catch(() => {});
+  };
   ctrl?.signal.addEventListener("abort", onAbort, { once: true });
 
   try {
@@ -135,16 +146,8 @@ async function _readStream(
     if (!aborted) _flush();
   } finally {
     ctrl?.signal.removeEventListener("abort", onAbort);
-    // [FREEZE #5 fix]
-    // 旧実装: reader.cancel() は onAbort 内で fire-and-forget (catch のみ) のため
-    //   cancel() の完了を待たずに releaseLock() を呼んでいた
-    //   → ReadableStream の仕様上 cancel 中に releaseLock() すると
-    //     「Failed to execute 'releaseLock' on 'ReadableStreamDefaultReader':
-    //      Cannot release a readable stream reader when readable stream is locked"
-    //     例外が発生しストリーム処理がフリーズすることがあった
-    //
-    // 新実装: cancel() を await して完全に完了してから releaseLock() を呼ぶ
-    //   どちらも失敗を握り潰す (already cancelled/released は無害)
+    // aborted 時は onAbort 内で既に cancel() を発行済みのため await のみ行う。
+    // 未 abort の場合は cancel 不要なので releaseLock だけ呼ぶ。
     if (aborted) {
       try { await reader.cancel(); } catch { /* already cancelled */ }
     }

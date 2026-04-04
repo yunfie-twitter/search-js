@@ -33,6 +33,7 @@ const FIELD_ALIASES: Record<string, readonly string[]> = {
   duration:      ["duration", "length"],
 };
 
+/** 検索結果配列からメタ情報のみを抽出する。lowMemory 時は HEAVY_FIELDS を除外する。 */
 export function extractMeta(
   data: unknown,
   type: SearchType = "web",
@@ -48,17 +49,23 @@ export function extractMeta(
       const v = _resolve(obj, f);
       if (v !== undefined) meta[f] = v;
     }
-    // _idx は必ず存在するので unknown 経由のキャストで型安全
     result[i] = meta as unknown as ResultMeta;
   }
   return result;
 }
 
+/**
+ * 検索結果配列から指定インデックスの詳細情報を抽出する。
+ * [QUALITY fix] ...obj スプレッドより先に _idx を明示的に上書きすることで、
+ * 元データに _idx フィールドが存在しても正しいインデックスが保たれる。
+ */
 export function extractDetail(data: unknown, idx: number): ResultDetail | null {
   const arr = _toArray(data);
   if (idx < 0 || idx >= arr.length) return null;
   const obj = _safeObj(arr[idx]);
   return {
+    ...obj,
+    // _idx は ...obj より後に上書きして正しい値を保証する
     _idx: idx,
     title:         _resolve(obj, "title"),
     url:           _resolve(obj, "url"),
@@ -68,10 +75,10 @@ export function extractDetail(data: unknown, idx: number): ResultDetail | null {
     summary:       _resolve(obj, "summary"),
     duration:      _resolve(obj, "duration"),
     publishedDate: _resolve(obj, "publishedDate"),
-    ...obj,
   };
 }
 
+/** ストリーミングチャンクを ResultMeta に変換する。 */
 export function chunkToMeta(
   chunk: unknown,
   type: SearchType = "web",
