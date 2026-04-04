@@ -102,12 +102,29 @@ async function _fetchSuggest(q: string): Promise<SuggestResult> {
   url.searchParams.set("type", "suggest");
 
   const promise = new Promise<SuggestResult>((resolve) => {
-    const timeout = setTimeout(() => {
+    // [FREEZE #4 fix]
+    // 旧実装: setTimeout(5000) と enqueue が競合し、タイムアウト後に enqueue のコールバックが
+    //   実行されると resolve が2回呼ばれる可能性があった (Promise 仕様上は無害だが
+    //   _inFlight に残骸が残り同一クエリを無限待機させるフリーズを起こしていた)
+    //
+    // 新実装: resolved フラグで「先勝ち」を保証し、どちらのパスでも
+    //   必ず _inFlight.delete(key) を実行する
+    let resolved = false;
+
+    const _resolve = (result: SuggestResult): void => {
+      if (resolved) return;
+      resolved = true;
       _inFlight.delete(key);
-      resolve({ ok: false, query: q, items: [], error: "timeout" });
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      _resolve({ ok: false, query: q, items: [], error: "timeout" });
     }, 5000);
 
     enqueue(async () => {
+      // タイムアウトで既に解決済みならスキップ
+      if (resolved) { clearTimeout(timeout); return; }
       try {
         const result: FetchResult = await fetchWithRetry(
           url.toString(),
@@ -115,17 +132,16 @@ async function _fetchSuggest(q: string): Promise<SuggestResult> {
           "suggest\x00" + key
         );
         if (!result.ok) {
-          resolve({ ok: false, query: q, items: [], error: result.error });
+          _resolve({ ok: false, query: q, items: [], error: result.error });
           return;
         }
         const items = _parse(result.data);
         _cacheSet(key, items);
-        resolve({ ok: true, query: q, items });
+        _resolve({ ok: true, query: q, items });
       } catch {
-        resolve({ ok: false, query: q, items: [], error: "unknown_error" });
+        _resolve({ ok: false, query: q, items: [], error: "unknown_error" });
       } finally {
         clearTimeout(timeout);
-        _inFlight.delete(key);
       }
     }, Priority.HIGH);
   });

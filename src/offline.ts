@@ -10,7 +10,18 @@ let _initialized = false;
 export function getIsOnline(): boolean { return _isOnline; }
 
 export function initOfflineMonitor(): void {
-  if (_initialized || typeof window === "undefined") return;
+  // [FREEZE #6 fix]
+  // 旧実装: _initialized チェックのみで、destroy() → init() の高速呼び出し時に
+  //   _initialized = false になる前に initOfflineMonitor() が再入し
+  //   イベントリスナーが二重登録されて _handleOnline/_handleOffline が2回発火
+  //   → emit("online") が2回 → 積まれていたリトライタスクが2重実行されフリーズ
+  //
+  // 新実装: 初期化前に必ず既存リスナーを除去してから再登録する
+  //   これにより destroy→init の競合状態でもリスナーは常に1本だけになる
+  if (typeof window === "undefined") return;
+  // 前回登録分を先に除去（二重登録防止）
+  window.removeEventListener("online",  _handleOnline);
+  window.removeEventListener("offline", _handleOffline);
   _initialized = true;
   _isOnline = navigator.onLine;
   window.addEventListener("online",  _handleOnline);

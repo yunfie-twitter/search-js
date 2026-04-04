@@ -135,6 +135,19 @@ async function _readStream(
     if (!aborted) _flush();
   } finally {
     ctrl?.signal.removeEventListener("abort", onAbort);
+    // [FREEZE #5 fix]
+    // 旧実装: reader.cancel() は onAbort 内で fire-and-forget (catch のみ) のため
+    //   cancel() の完了を待たずに releaseLock() を呼んでいた
+    //   → ReadableStream の仕様上 cancel 中に releaseLock() すると
+    //     「Failed to execute 'releaseLock' on 'ReadableStreamDefaultReader':
+    //      Cannot release a readable stream reader when readable stream is locked"
+    //     例外が発生しストリーム処理がフリーズすることがあった
+    //
+    // 新実装: cancel() を await して完全に完了してから releaseLock() を呼ぶ
+    //   どちらも失敗を握り潰す (already cancelled/released は無害)
+    if (aborted) {
+      try { await reader.cancel(); } catch { /* already cancelled */ }
+    }
     try { reader.releaseLock(); } catch { /* already released */ }
     buf = "";
   }
