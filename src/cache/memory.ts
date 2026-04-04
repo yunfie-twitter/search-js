@@ -16,6 +16,8 @@ interface CacheHit {
 export const store = new Map<string, CacheItem>();
 
 const _SEP = "\x00";
+
+/** エンドポイントとパラメータからキャッシュキーを生成する。 */
 export function getCacheKey(endpoint: string, params: Record<string, unknown>): string {
   const sorted = Object.keys(params).sort();
   let key = endpoint;
@@ -26,6 +28,7 @@ export function getCacheKey(endpoint: string, params: Record<string, unknown>): 
   return key;
 }
 
+/** キャッシュから取得する。ヒット時はエントリを LRU 末尾に移動する。 */
 export function get(key: string): CacheHit | null {
   const item = store.get(key);
   if (!item) return null;
@@ -38,9 +41,12 @@ export function get(key: string): CacheHit | null {
   return { data: item.parsed ?? item.data, expired: Date.now() - item.time > getConfig().CACHE_TTL };
 }
 
+/** キャッシュにデータを書き込む。上限超過時は LRU 先頭から削除する。 */
 export function set(key: string, data: unknown): void {
   if (data == null) return;
   const max = getCurrentCacheMax();
+  // [QUALITY fix] max が 0 以下の場合は何もしない（無限ループ防止）
+  if (max <= 0) return;
   if (store.has(key)) store.delete(key);
   while (store.size >= max) {
     const firstKey = store.keys().next().value;
@@ -58,8 +64,8 @@ export function set(key: string, data: unknown): void {
   });
 }
 
+/** TTL 切れエントリを一括削除する。イテレート中の Map 変更を避けるため削除は二段階。 */
 export function evictExpired(): void {
-  // #4 fix: イテレート中に Map を変更しないよう削除キーを先に収集する
   const ttl = getConfig().CACHE_TTL;
   const now = Date.now();
   const toDelete: string[] = [];
@@ -69,6 +75,7 @@ export function evictExpired(): void {
   for (const key of toDelete) store.delete(key);
 }
 
+/** Critical メモリ状態時にキャッシュを半分に切り捨てる。 */
 export function trimToHalf(): void {
   if (!getIsCriticalMemory()) return;
   const half = Math.ceil(store.size / 2);
@@ -79,4 +86,5 @@ export function trimToHalf(): void {
   }
 }
 
+/** キャッシュを全削除する。 */
 export function clearStore(): void { store.clear(); }

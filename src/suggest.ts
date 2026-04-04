@@ -76,6 +76,7 @@ function _cacheFindPrefix(q: string): SuggestCacheEntry | null {
   return null;
 }
 
+/** サジェストキャッシュを全削除する。 */
 export function clearSuggestCache(): void {
   _cache.clear();
 }
@@ -102,13 +103,6 @@ async function _fetchSuggest(q: string): Promise<SuggestResult> {
   url.searchParams.set("type", "suggest");
 
   const promise = new Promise<SuggestResult>((resolve) => {
-    // [FREEZE #4 fix]
-    // 旧実装: setTimeout(5000) と enqueue が競合し、タイムアウト後に enqueue のコールバックが
-    //   実行されると resolve が2回呼ばれる可能性があった (Promise 仕様上は無害だが
-    //   _inFlight に残骸が残り同一クエリを無限待機させるフリーズを起こしていた)
-    //
-    // 新実装: resolved フラグで「先勝ち」を保証し、どちらのパスでも
-    //   必ず _inFlight.delete(key) を実行する
     let resolved = false;
 
     const _resolve = (result: SuggestResult): void => {
@@ -123,7 +117,6 @@ async function _fetchSuggest(q: string): Promise<SuggestResult> {
     }, 5000);
 
     enqueue(async () => {
-      // タイムアウトで既に解決済みならスキップ
       if (resolved) { clearTimeout(timeout); return; }
       try {
         const result: FetchResult = await fetchWithRetry(
@@ -179,6 +172,7 @@ function _toArray(data: unknown): unknown[] {
   return [];
 }
 
+/** サジェストを取得する。低メモリ時はキャッシュを半分に削減してから取得する。 */
 export function getSuggest(q: string): Promise<SuggestResult> {
   if (!q.trim()) return Promise.resolve({ ok: true, query: q, items: [] });
   if (getIsLowMemory()) {
@@ -195,24 +189,26 @@ export function getSuggest(q: string): Promise<SuggestResult> {
 /* =========================
  * createSuggestDebouncer
  *
- * [FREEZE #1 #2 fix]
- * 旧実装: _handles をグローバル Map で delay 単位に共有
- *   → 複数コンポーネントが同じ handle を競合、StrictMode で古い callback が残りフリーズ
- *
- * 新実装: 呼び出しごとに独立したタイマー状態を持つクロージャを返す
- *   → コンポーネントごとに debouncer を作成し、unmount 時に cancel() を呼ぶだけでよい
+ * 呼び出しごとに独立したタイマー状態を持つクロージャを返す。
+ * コンポーネントごとに debouncer を作成し、unmount 時に cancel() を呼ぶだけでよい。
  *
  * 使い方 (React):
  *   const debouncer = useMemo(() => createSuggestDebouncer(), []);
- *   useEffect(() => () => debouncer.cancel(), []);
+ *   useEffect(() => () => debouncer.cancel(), [debouncer]);
  *   // 入力時: debouncer.fetch(q, setSuggestions);
  * ========================= */
 
 export interface SuggestDebouncer {
+  /** クエリを debounce して getSuggest を呼び出し、結果を callback に渡す。 */
   fetch(q: string, callback: (result: SuggestResult) => void): void;
+  /** 保留中のタイマーをキャンセルする。 */
   cancel(): void;
 }
 
+/**
+ * コンポーネントごとに独立した SuggestDebouncer を生成する。
+ * @param wait - デバウンス待機時間(ms)。省略時は config の SUGGEST_DEBOUNCE_MS を使用。
+ */
 export function createSuggestDebouncer(wait?: number): SuggestDebouncer {
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -245,16 +241,21 @@ export function createSuggestDebouncer(wait?: number): SuggestDebouncer {
  * グローバルな debouncer を delay ごとに1つ保持する。
  * 単一コンポーネントでの使用に限り後方互換を維持。
  * 複数コンポーネントで使う場合は createSuggestDebouncer() を使うこと。
- * キャンセル関数を返すので useEffect の cleanup に渡せる。
  * ========================= */
+// [QUALITY fix] Map のキーは整数に統一。float の delay が来ても同一 debouncer を再利用できる。
 const _globalDebouncers = new Map<number, SuggestDebouncer>();
 
+/**
+ * グローバルな debouncer を使ってサジェストを取得する(後方互換)。
+ * 戻り値のキャンセル関数を useEffect の return に渡すことで cleanup できる。
+ */
 export function getSuggestDebounced(
   q: string,
   callback: (result: SuggestResult) => void,
   wait?: number
 ): () => void {
-  const delay = wait ?? getConfig().SUGGEST_DEBOUNCE_MS;
+  // [QUALITY fix] Math.floor で整数キーに正規化し、float 値による重複 debouncer を防ぐ
+  const delay = Math.floor(wait ?? getConfig().SUGGEST_DEBOUNCE_MS);
 
   let debouncer = _globalDebouncers.get(delay);
   if (!debouncer) {
@@ -264,10 +265,10 @@ export function getSuggestDebounced(
 
   debouncer.fetch(q, callback);
 
-  // キャンセル関数を返す → useEffect の return に渡せる
   return () => debouncer!.cancel();
 }
 
+/** 全グローバル debouncer をキャンセルして破棄する。destroy() から呼ぶこと。 */
 export function clearSuggestDebouncers(): void {
   for (const d of _globalDebouncers.values()) d.cancel();
   _globalDebouncers.clear();

@@ -18,13 +18,14 @@ const capabilities: Capabilities = {
 
 let isLowMemory = false;
 let isCriticalMemory = false;
-let currentCacheMax = defaults.CACHE_MAX; // #7 fix: 初期値を 0 ではなく defaults に
+let currentCacheMax = defaults.CACHE_MAX;
 let _monitorTimer: ReturnType<typeof setInterval> | null = null;
 
 export const getIsLowMemory = (): boolean => isLowMemory;
 export const getIsCriticalMemory = (): boolean => isCriticalMemory;
 export const getCurrentCacheMax = (): number => currentCacheMax;
 
+/** メモリ監視タイマーを開始する。init() から呼ぶこと。 */
 export function initMemoryMonitor(cacheRef: Map<unknown, unknown>): void {
   if (_monitorTimer !== null) {
     clearInterval(_monitorTimer);
@@ -42,6 +43,7 @@ export function initMemoryMonitor(cacheRef: Map<unknown, unknown>): void {
   _monitorTimer = setInterval(() => _check(cacheRef), cfg.MEMORY_CHECK_INTERVAL);
 }
 
+/** メモリ監視タイマーを停止してフラグをリセットする。destroy() から呼ぶこと。 */
 export function destroyMemoryMonitor(): void {
   if (_monitorTimer !== null) {
     clearInterval(_monitorTimer);
@@ -49,7 +51,6 @@ export function destroyMemoryMonitor(): void {
   }
   isLowMemory = false;
   isCriticalMemory = false;
-  // #7 fix: destroy 後に set() が呼ばれても無限ループしないようデフォルト値に戻す
   currentCacheMax = defaults.CACHE_MAX;
 }
 
@@ -64,7 +65,6 @@ function _check(cacheRef: Map<unknown, unknown>): void {
     pressure = Math.max(pressure, (mem.usedJSHeapSize / mem.jsHeapSizeLimit) * 100);
   }
 
-  // #6 fix: 直値 65 を Config 定数と連動させる
   if (cacheRef.size > currentCacheMax * 0.85) {
     pressure = Math.max(pressure, cfg.MEMORY_PRESSURE_NORMAL * 100);
   }
@@ -86,9 +86,11 @@ function _check(cacheRef: Map<unknown, unknown>): void {
     const target = isCriticalMemory
       ? Math.ceil(cfg.CACHE_LOW_MEMORY * 0.5)
       : cfg.CACHE_LOW_MEMORY;
-    if (currentCacheMax > target) {
-      _trimCache(cacheRef, target);
-      currentCacheMax = target;
+    // [QUALITY fix] target が 0 以下にならないよう最低値 1 を保証する
+    const safeTarget = Math.max(1, target);
+    if (currentCacheMax > safeTarget) {
+      _trimCache(cacheRef, safeTarget);
+      currentCacheMax = safeTarget;
     }
   } else if (!isLowMemory && prevLow) {
     currentCacheMax = Math.min(cfg.CACHE_MAX, Math.ceil(currentCacheMax * 1.5));
@@ -96,7 +98,12 @@ function _check(cacheRef: Map<unknown, unknown>): void {
 }
 
 function _trimCache(cacheRef: Map<unknown, unknown>, maxSize: number): void {
-  while (cacheRef.size > maxSize) {
+  // [QUALITY fix] maxSize が 0 以下の場合でも安全に動作するよう保護
+  const safeMax = Math.max(0, maxSize);
+  let iterations = 0;
+  const limit = cacheRef.size;
+  while (cacheRef.size > safeMax && iterations < limit) {
+    iterations++;
     const firstKey = cacheRef.keys().next().value;
     if (firstKey !== undefined) cacheRef.delete(firstKey);
     else break;

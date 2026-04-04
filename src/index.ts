@@ -46,14 +46,18 @@ export type SearchType = "web" | "image" | "video" | "news" | "panel";
 const HEAVY_TYPES: ReadonlySet<SearchType> = new Set(["image", "video"]);
 
 export interface SearchOptions {
+  /** 検索クエリ */
   q: string;
+  /** ページ番号 (デフォルト: 1) */
   page?: number;
+  /** 検索タイプ (デフォルト: "web") */
   type?: SearchType;
   safesearch?: 0 | 1 | 2;
   lang?: string;
   enableStreaming?: boolean;
   onChunk?: (chunk: unknown) => void;
   usePersistentCache?: boolean;
+  /** true の場合メタ情報のみを返す (軽量モード) */
   metaOnly?: boolean;
   signal?: AbortSignal;
 }
@@ -75,6 +79,7 @@ export interface SearchStats {
   isOnline: boolean;
 }
 
+/** 現在のキャッシュ・メモリ・ネットワーク状態を返す。デバッグ用途。 */
 export function getSearchStats(): SearchStats {
   return {
     memoryCacheSize:  memStore.size,
@@ -89,6 +94,10 @@ export function getSearchStats(): SearchStats {
 let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 let _destroyed = false;
 
+/**
+ * ライブラリを初期化する。アプリ起動時に一度だけ呼ぶこと。
+ * @param options - Config の部分的な上書き設定
+ */
 export function init(options: Partial<Config> = {}): void {
   _destroyed = false;
   configure(options);
@@ -98,6 +107,10 @@ export function init(options: Partial<Config> = {}): void {
   _cleanupTimer = setInterval(cleanup, getConfig().PERSISTENT_CLEANUP_INTERVAL);
 }
 
+/**
+ * ライブラリのリソースを全て解放する。
+ * 再利用する場合は init() を再度呼ぶこと。
+ */
 export async function destroy(): Promise<void> {
   _destroyed = true;
   cancelAll();
@@ -184,12 +197,23 @@ async function request(
   const fetchOpts: RequestInit = signal ? { ..._fetchOpts, signal } : _fetchOpts;
 
   const promise = new Promise<FetchResult>((resolve) => {
-    const onAbort = (): void => resolve({ ok: false, error: "cancelled" });
+    // [FREEZE fix] onAbort 経由で resolve した場合も必ず inFlight から削除する。
+    // 旧実装では finally で削除していたが、onAbort パスは enqueue コールバックの
+    // 外側で resolve するため finally が実行されず inFlight に残骸が残っていた。
+    let settled = false;
+    const _settle = (result: FetchResult): void => {
+      if (settled) return;
+      settled = true;
+      inFlight.delete(reqKey);
+      resolve(result);
+    };
+
+    const onAbort = (): void => _settle({ ok: false, error: "cancelled" });
     signal?.addEventListener("abort", onAbort, { once: true });
 
     enqueue(async () => {
       signal?.removeEventListener("abort", onAbort);
-      if (signal?.aborted) { resolve({ ok: false, error: "cancelled" }); return; }
+      if (signal?.aborted) { _settle({ ok: false, error: "cancelled" }); return; }
       try {
         const result = await fetchWithRetry(url.toString(), fetchOpts, reqKey, onChunk ?? undefined);
         if (result.ok && useCache && !result.streamed) {
@@ -205,11 +229,9 @@ async function request(
             }
           });
         }
-        resolve(result);
+        _settle(result);
       } catch (e) {
-        resolve({ ok: false, error: e instanceof Error ? e.message : "unknown_error" });
-      } finally {
-        inFlight.delete(reqKey);
+        _settle({ ok: false, error: e instanceof Error ? e.message : "unknown_error" });
       }
     }, priority);
   });
@@ -232,6 +254,9 @@ function _prefetch(endpoint: string, params: Record<string, unknown>): void {
   request(endpoint, params, { priority: Priority.LOW }).catch(() => {});
 }
 
+/**
+ * 検索を実行する。キャッシュがある場合はキャッシュを返しつつバックグラウンドで更新する。
+ */
 export async function search({
   q, page = 1, type = "web", safesearch = 0, lang = "ja",
   enableStreaming = false, onChunk, usePersistentCache = false, metaOnly = false, signal,
@@ -241,7 +266,6 @@ export async function search({
   const isHeavy    = HEAVY_TYPES.has(type);
   const forceStream = isHeavy && lowMem;
   const params = { q: q.trim(), page, type, safesearch, lang };
-  // [LOW #9 fix] 余計な prefetchMaxPage 変数を削除して元の条件に戻す
   if (page < 10 && !lowMem) _prefetch("/search", { ...params, page: page + 1 });
   if (forceStream || (enableStreaming && onChunk)) {
     return request("/search", params, { priority: Priority.NORMAL, onChunk: onChunk ?? undefined, usePersistentCache, signal });
@@ -254,10 +278,12 @@ export async function search({
   return result;
 }
 
+/** メタ情報のみを取得する軽量版 search。 */
 export function searchMeta(opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">): Promise<FetchResult> {
   return search({ ...opts, metaOnly: true });
 }
 
+/** キャッシュから指定インデックスの詳細情報を取得する。キャッシュがなければリクエストする。 */
 export async function fetchDetail(
   opts: Omit<SearchOptions, "metaOnly" | "enableStreaming" | "onChunk">,
   idx: number
@@ -276,6 +302,7 @@ export async function fetchDetail(
   return result.ok ? extractDetail(result.data, idx) : null;
 }
 
+/** サジェストを取得する。 */
 export function getSuggest(q: string): Promise<SuggestResult> { return _getSuggest(q); }
 
 export interface Pager {
@@ -285,6 +312,11 @@ export interface Pager {
   reset(): void;
 }
 
+/**
+ * ページネーション用のページャーを生成する。
+ * @param opts - SearchOptions から page を除いたオプション
+ * @param maxPage - 最大ページ数 (デフォルト: 10)
+ */
 export function createPager(opts: Omit<SearchOptions, "page">, maxPage = 10): Pager {
   let _page = 0;
   return {
@@ -297,6 +329,11 @@ export function createPager(opts: Omit<SearchOptions, "page">, maxPage = 10): Pa
 
 export type SearchAllResult = Partial<Record<SearchType, FetchResult>>;
 
+/**
+ * 複数の検索タイプを並行して実行する。
+ * @param opts - 共通の SearchOptions
+ * @param types - 実行するタイプ一覧 (デフォルト: ["web", "news"])
+ */
 export async function searchAll(
   opts: Omit<SearchOptions, "type">,
   types: SearchType[] = ["web", "news"]
@@ -310,8 +347,13 @@ export async function searchAll(
   return result;
 }
 
+/** Web 検索のショートハンド */
 export const searchWeb   = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "web",   signal });
+/** 画像検索のショートハンド */
 export const searchImage = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "image", signal });
+/** 動画検索のショートハンド */
 export const searchVideo = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "video", signal });
+/** ニュース検索のショートハンド */
 export const searchNews  = (q: string, page = 1, signal?: AbortSignal): Promise<FetchResult> => search({ q, page, type: "news",  signal });
+/** パネル検索のショートハンド */
 export const searchPanel = (q: string,            signal?: AbortSignal): Promise<FetchResult> => search({ q,       type: "panel", signal });
